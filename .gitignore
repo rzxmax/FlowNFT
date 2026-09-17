@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.claude/
+.cursor/
+.idea/
+.pytest_cache/
+
+# 虚拟环境
+venv*/
+env/
+.venv/
+
+# 检查点与模型权重
+checkpoints/
+/pretrain-checkpoints
+/good_checkpoint
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# 数据集
+data/
+/episodes
+mn_dataset/
+benchmark/
+CompoSuite/
+ManiSkill/
+*.zarr
+*.hdf5
+*.h5
+*.npz
+*.npy
+*.pkl
+*.parquet
+*.arrow
+
+# 视频与图像输出
+videos/
+*.mp4
+*.avi
+*.gif
+
+# 训练日志与结果
+wandb/
+train_history/
+test_history/
+*.log
+test_results_*.json
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 环境变量
+.env
+.env.*

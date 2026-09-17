@@ -1,0 +1,100 @@
+# ── Core Deep Learning ──────────────────────────────────────────────────────
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+triton==3.2.0
+xformers==0.0.29.post3
+
+# ── HuggingFace Ecosystem ────────────────────────────────────────────────────
+transformers==4.40.0
+diffusers==0.33.1
+accelerate==1.4.0
+peft==0.10.0
+safetensors==0.5.3
+tokenizers==0.19.1
+datasets==3.3.2
+bitsandbytes==0.45.3
+
+# ── Flow Matching / ODE / SDE ────────────────────────────────────────────────
+torchcfm==1.0.7
+torchdiffeq==0.2.5
+torchsde==0.2.6
+torchdyn==1.0.6
+torchcde==0.2.5
+
+# ── Training Utilities ───────────────────────────────────────────────────────
+pytorch-lightning==1.9.5
+deepspeed==0.16.4
+einops==0.8.1
+omegaconf==2.3.0
+wandb==0.18.7
+tensorboardX==2.6.4
+torchinfo==1.8.0
+torchmetrics==1.7.2
+absl-py==2.3.0
+ml-collections==0.1.1
+
+# ── 3D / Robotics ────────────────────────────────────────────────────────────
+pytorch-kinematics==0.7.5
+mani_skill==3.0.0b21
+mujoco==3.1.6
+robosuite==1.4.0
+sapien==3.0.0b1
+mplib==0.1.1
+transforms3d==0.4.2
+pyquaternion==0.9.9
+fast_kinematics==0.2.2
+
+# ── Data / Serialization ─────────────────────────────────────────────────────
+numpy==1.26.4
+zarr==2.18.2
+numcodecs==0.12.1
+h5py==3.14.0
+scipy==1.13.1
+pandas==2.2.3
+scikit-learn==1.6.1
+scikit-image==0.24.0
+scikit-video==1.1.11
+opencv-python==4.11.0.86
+pillow==10.4.0
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+moviepy==2.2.1
+
+# ── Visualization ────────────────────────────────────────────────────────────
+matplotlib==3.9.4
+seaborn==0.8.1
+tqdm==4.67.1
+
+# ── RL / Environments ────────────────────────────────────────────────────────
+pygame==2.1.0
+pymunk==7.0.1
+pybullet==3.2.7
+gym==0.15.7  # legacy PushT model
+gymnasium==0.29.1
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+wheel==0.45.1
+gdown==5.2.0
+shapely==2.0.7
+termcolor==2.4.0
+ipython==8.18.1
+POT==0.9.5
+dacite==1.9.2
+sentencepiece==0.2.0
+pydantic==2.10.6
+python-dotenv==1.2.1
+rich==14.0.0
+
+# ── Code Quality ─────────────────────────────────────────────────────────────
+pylint==3.3.7
+mako==1.3.10
+lxml==5.4.0
+terminaltables==3.1.10
+pytest==8.4.1
+
+# ── Git-based / Local Dependencies (install manually) ────────────────────────
+# The following packages are installed from source and must be set up manually:
+
+# flow_grpo:
+#   pip install -e git+https://github.com/yifan123/flow_grpo.git
