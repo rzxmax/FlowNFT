@@ -6,7 +6,7 @@ from train.common.bootstrap import PROJECT_ROOT
 
 
 def resolve_pretrain_checkpoint(config, requested=None):
-    checkpoint_dir = Path(config.pretrain.checkpoint_dir).expanduser()
+    checkpoint_dir = Path(config.pretrain_checkpoint_dir).expanduser()
     if not checkpoint_dir.is_absolute():
         checkpoint_dir = PROJECT_ROOT / checkpoint_dir
 
@@ -34,7 +34,7 @@ def resolve_pretrain_checkpoint(config, requested=None):
     if not checkpoint_dir.is_dir():
         raise FileNotFoundError(f"预训练 checkpoint 目录不存在: {checkpoint_dir}")
 
-    obs_mode = config.pretrain.obs_mode
+    obs_mode = config.env_kwargs.obs_mode
     checkpoints = [
         path for path in checkpoint_dir.glob('*.pth')
         if 'failed' not in path.stem

@@ -5,11 +5,12 @@ import pytest
 import torch
 from types import SimpleNamespace
 
-from config.imitation_pointcloud import get_config as pointcloud_config
-from config.imitation_rgbd import get_config as rgbd_config
-from config.imitation_state import get_config as state_config
-from config.reinforcement_diffusionnft import get_config as diffusionnft_config
-from config.reinforcement_stepnft import get_config as stepnft_config
+from config.robot_base import get_config as robot_config
+from config.imitation.imitation_pointcloud import get_config as pointcloud_config
+from config.imitation.imitation_rgbd import get_config as rgbd_config
+from config.imitation.imitation_state import get_config as state_config
+from config.reinforcement.reinforcement_diffusionnft import get_config as diffusionnft_config
+from config.reinforcement.reinforcement_stepnft import get_config as stepnft_config
 from train.common.checkpoint import save_ckpt
 from train.common.observations import sample_pcd
 from train.common.sampling import _unet_timestep_input, denoise_with_sde_snap
@@ -20,6 +21,7 @@ from train.reinforcement.losses import diffusionnft, stepnft
 
 
 def test_stage_configs_are_independent():
+    shared = robot_config()
     state = state_config()
     pointcloud = pointcloud_config()
     rgbd = rgbd_config()
@@ -30,6 +32,15 @@ def test_stage_configs_are_independent():
             rgbd.pretrain.obs_mode) == ('state', 'pointcloud', 'image')
     assert diffusionnft.train.loss_type == 'rollout'
     assert stepnft.train.loss_type == 'stepnft'
+    assert 'pretrain' not in shared and 'train' not in shared
+    assert 'obs_mode' not in shared.env_kwargs and 'max_episode_steps' not in shared
+    assert 'train' not in state and 'pretrain' not in diffusionnft
+    assert (state.env_kwargs.obs_mode, pointcloud.env_kwargs.obs_mode,
+            rgbd.env_kwargs.obs_mode) == ('state', 'pointcloud', 'rgbd')
+    assert 'pcd_n_points' not in state.pretrain
+    assert 'img_size' not in pointcloud.pretrain
+    assert 'stepnft_beta' not in diffusionnft.train
+    assert 'beta' not in stepnft.train
     pointcloud.pretrain.obs_mode = 'state'
     assert rgbd.pretrain.obs_mode == 'image'
 
@@ -52,38 +63,40 @@ def test_imitation_dispatch_and_loss_flags(monkeypatch):
         )
 
 
-def test_legacy_entrypoint_keeps_stage_dispatch(monkeypatch):
-    import train_sd3_robot_grpo as legacy
-    from train.reinforcement import runner as reinforcement_runner
+def test_stage_entrypoints_dispatch(monkeypatch):
+    from train.reinforcement import main as reinforcement_main
 
-    config = state_config()
+    imitation = state_config()
+    reinforcement = diffusionnft_config()
     calls = []
-    flags = SimpleNamespace(
-        config=config, gpu=3, test=False, sampletest=False,
-        pretrain=True, pretrain_auto=False, action_loss=False,
-        velocity_loss=True, pretrain_checkpoint='checkpoint.pth',
+    imitation_flags = SimpleNamespace(
+        config=imitation, gpu=3, pretrain_auto=False, action_loss=False,
+        velocity_loss=True, validate_only=False,
+    )
+    reinforcement_flags = SimpleNamespace(
+        config=reinforcement, gpu=3, pretrain_checkpoint='checkpoint.pth',
         validate_only=False,
     )
-    monkeypatch.setattr(legacy, 'FLAGS', flags)
+    monkeypatch.setattr(imitation_main, 'FLAGS', imitation_flags)
+    monkeypatch.setattr(reinforcement_main, 'FLAGS', reinforcement_flags)
     monkeypatch.setattr(
         imitation_main, 'run_imitation',
         lambda cfg, gpu, **kwargs: calls.append(('imitation', cfg, gpu, kwargs)),
     )
     monkeypatch.setattr(
-        reinforcement_runner, 'run_reinforcement',
+        reinforcement_main, 'run_reinforcement',
         lambda cfg, gpu, **kwargs: calls.append(('reinforcement', cfg, gpu, kwargs)),
     )
 
-    assert legacy.main(None) is None
+    assert imitation_main.main(None) is None
     assert calls[-1] == (
-        'imitation', config, 3,
+        'imitation', imitation, 3,
         {'auto': False, 'action_loss': False, 'velocity_loss': True},
     )
 
-    flags.pretrain = False
-    assert legacy.main(None) is None
+    assert reinforcement_main.main(None) is None
     assert calls[-1] == (
-        'reinforcement', config, 3,
+        'reinforcement', reinforcement, 3,
         {'pretrain_checkpoint': 'checkpoint.pth'},
     )
 
@@ -101,7 +114,7 @@ def test_pointcloud_filter_and_padding():
 
 
 def test_advantage_modes():
-    config = state_config()
+    config = diffusionnft_config()
     config.stage.advantage_type = 'single'
     config.stage.max_reward = 5.0
     samples = [{'reward': 5.0}, {'reward': 1.0}]
@@ -196,17 +209,17 @@ def test_reinforcement_checkpoint_keeps_imitation_metadata(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize(
-    ('loss_module', 'loss_function'),
+    ('loss_module', 'loss_function', 'config_factory'),
     [
-        (diffusionnft, diffusionnft.train_on_episode_samples_diffusionnft),
-        (stepnft, stepnft.train_on_episode_samples_stepnft),
+        (diffusionnft, diffusionnft.train_on_episode_samples_diffusionnft, diffusionnft_config),
+        (stepnft, stepnft.train_on_episode_samples_stepnft, stepnft_config),
     ],
 )
-def test_rl_losses_handle_empty_rollout_on_cpu(monkeypatch, loss_module, loss_function):
+def test_rl_losses_handle_empty_rollout_on_cpu(monkeypatch, loss_module, loss_function, config_factory):
     import logging
 
     monkeypatch.setattr(loss_module, 'logger', logging.getLogger(__name__))
-    config = state_config()
+    config = config_factory()
     policy = torch.nn.Linear(4, 4)
     old_policy = torch.nn.Linear(4, 4)
     ref_policy = torch.nn.Linear(4, 4)

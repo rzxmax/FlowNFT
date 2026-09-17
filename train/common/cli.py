@@ -1,4 +1,4 @@
-"""The legacy absl flags shared by the two new training entry points."""
+"""Flags shared by the imitation and reinforcement entry points."""
 
 from absl import flags
 from ml_collections import config_flags
@@ -7,7 +7,7 @@ from ml_collections import config_flags
 FLAGS = flags.FLAGS
 
 config_flags.DEFINE_config_file(
-    'config', 'config/robot_base.py', 'Training configuration.'
+    'config', None, 'Stage-specific training configuration file (required).'
 )
 flags.DEFINE_bool('train', True, 'Run reinforcement training')
 flags.DEFINE_bool('test', False, 'Run testing')

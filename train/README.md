@@ -26,33 +26,34 @@ train/
         └── stepnft.py       # 单步 NFT/DPO loss
 ```
 
-所有配置保留在项目根目录的 `config/`。`config/robot_base.py` 是旧配置兼容基底，
-按任务选择 `config/imitation_*.py` 或 `config/reinforcement_*.py`。配置预设每次调用
+`config/robot_base.py` 只包含两类训练共用的环境和采样参数；
+模仿训练使用 `config/imitation/`，强化训练使用 `config/reinforcement/`。
+启动训练时必须通过 `--config` 选择对应阶段的预设。每次调用
 `get_config()` 都返回独立对象。
 
 从仓库根目录运行：
 
 ```bash
 # 低维状态模仿预训练
-python -m train.imitation.main --config=config/imitation_state.py --gpu=0
+python -m train.imitation.main --config=config/imitation/imitation_state.py --gpu=0
 
 # 点云模仿预训练
-python -m train.imitation.main --config=config/imitation_pointcloud.py --gpu=0
+python -m train.imitation.main --config=config/imitation/imitation_pointcloud.py --gpu=0
 
 # RGB-D 模仿预训练
-python -m train.imitation.main --config=config/imitation_rgbd.py --gpu=0
+python -m train.imitation.main --config=config/imitation/imitation_rgbd.py --gpu=0
 
 # Flow Matching 速度场监督（也可对上面的任一模仿配置使用）
-python -m train.imitation.main --config=config/imitation_state.py --velocity_loss --gpu=0
+python -m train.imitation.main --config=config/imitation/imitation_state.py --velocity_loss --gpu=0
 
 # DiffusionNFT rollout 强化微调
 python -m train.reinforcement.main \
-  --config=config/reinforcement_diffusionnft.py \
+  --config=config/reinforcement/reinforcement_diffusionnft.py \
   --pretrain_checkpoint=checkpoints/imitation/<checkpoint>.pth --gpu=0
 
 # StepNFT 强化微调
 python -m train.reinforcement.main \
-  --config=config/reinforcement_stepnft.py \
+  --config=config/reinforcement/reinforcement_stepnft.py \
   --pretrain_checkpoint=checkpoints/imitation/<checkpoint>.pth --gpu=0
 ```
 
@@ -73,7 +74,7 @@ data/datasets/
 ```
 
 模仿训练的数据读取器位于 `dataset/`，直接从 ManiSkill replay 生成的 H5
-按需读取轨迹。`config/imitation_pointcloud.py` 与 `config/imitation_rgbd.py`
+按需读取轨迹。`config/imitation/imitation_pointcloud.py` 与 `config/imitation/imitation_rgbd.py`
 的 `pretrain.dataset_path` 默认指向 `~/.maniskill/demos/PickCube-v1/motionplanning/`
 下各自的 replay H5。state 配置目前使用已有的 episode 目录；取得带
 `obs_mode=state` 的 replay H5 后，也可把同一配置项改为该 H5 路径。
@@ -100,8 +101,8 @@ data/datasets/
 ```bash
 ./venv_fm/bin/python -m pytest -q test/test_training_structure.py
 ./venv_fm/bin/python -m compileall -q train config train_sd3_robot_grpo.py
-python -m train.imitation.main --config=config/imitation_state.py --validate_only
-python -m train.reinforcement.main --config=config/reinforcement_diffusionnft.py --validate_only
+python -m train.imitation.main --config=config/imitation/imitation_state.py --validate_only
+python -m train.reinforcement.main --config=config/reinforcement/reinforcement_diffusionnft.py --validate_only
 ```
 
 CPU 测试覆盖配置预设、旧入口分发、点云过滤、advantage、时间步/EMA 系数以及

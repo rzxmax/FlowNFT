@@ -57,6 +57,9 @@ from flow_grpo.diffusers_patch.robot_sde_pipeline_with_logprob_unet import (
     RobotActionPipeline, ActionDecoder
 )
 from diffusers import FlowMatchEulerDiscreteScheduler
+from config.robot_base import get_config as get_robot_config
+
+ROBOT_CONFIG = get_robot_config()
 
 
 # ===========================================================================
@@ -562,12 +565,12 @@ def run_episodes(
 
 def evaluate_checkpoint(
     checkpoint_path,
-    env_id="PickCube-v1",
+    env_id=ROBOT_CONFIG.env_id,
     num_episodes=10,
     num_inference_steps=None,
     deterministic=True,  # ✅ DiffusionNFT: 默认使用ODE确定性模式
     max_steps=500,
-    action_horizon=16,  # 与训练配置一致：一次flow生成16步动作
+    action_horizon=ROBOT_CONFIG.action_horizon,
     render=False,
     gpu_id=0,
     train_episode_ids_file="",  # 训练集episode_ids文件路径
@@ -619,7 +622,7 @@ def evaluate_checkpoint(
 
     checkpoint = torch.load(checkpoint_file, map_location='cpu', weights_only=False)
     if num_inference_steps is None:
-        num_inference_steps = checkpoint.get('sample_num_steps') or 10
+        num_inference_steps = checkpoint.get('sample_num_steps') or ROBOT_CONFIG.sample.eval_num_steps
     print(f"实际推理步数: {num_inference_steps}")
     
     # ✅ 优先从 checkpoint 元数据读取架构超参（训练侧 save_ckpt 已写入），
@@ -635,6 +638,8 @@ def evaluate_checkpoint(
     obs_mode = checkpoint.get('obs_mode') or saved_config.get('pretrain', {}).get(
         'obs_mode', saved_config.get('env_kwargs', {}).get('obs_mode', 'state')
     )
+    if obs_mode == 'rgbd':
+        obs_mode = 'image'
     action_dim     = _meta_or(4, 'action_dim')
     action_horizon = _meta_or(action_horizon, 'action_horizon')
 
@@ -1064,7 +1069,7 @@ def main():
     parser = argparse.ArgumentParser(description='评估 train/ 生成的 .pth checkpoint 在 ManiSkill 中的成功率')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='预训练 .pth 文件、强化训练 model.pth 文件或包含 model.pth 的目录')
-    parser.add_argument('--env_id', type=str, default='PickCube-v1',
+    parser.add_argument('--env_id', type=str, default=ROBOT_CONFIG.env_id,
                        help='ManiSkill环境ID')
     parser.add_argument('--num_episodes', type=int, default=50,
                        help='验证集（随机）测试episode数量')
@@ -1074,7 +1079,7 @@ def main():
                        help='使用确定性ODE生成（DiffusionNFT方法，默认开启）')
     parser.add_argument('--max_steps', type=int, default=500,
                        help='每个episode的最大步数')
-    parser.add_argument('--action_horizon', type=int, default=16,
+    parser.add_argument('--action_horizon', type=int, default=ROBOT_CONFIG.action_horizon,
                        help='动作序列长度（与训练配置一致）')
     parser.add_argument('--render', action='store_true',
                        help='保存视频（会在视频中显示timestep和reward）')

@@ -9,7 +9,8 @@ from train.reinforcement import checkpoint_input
 
 def _config(directory, *, resume_from=''):
     return SimpleNamespace(
-        pretrain=SimpleNamespace(checkpoint_dir=str(directory), obs_mode='state'),
+        pretrain_checkpoint_dir=str(directory),
+        env_kwargs=SimpleNamespace(obs_mode='state'),
         resume_from=resume_from,
     )
 

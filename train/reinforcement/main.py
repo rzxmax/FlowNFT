@@ -11,6 +11,8 @@ from train.reinforcement.runner import run_reinforcement
 
 
 def main(_):
+    if FLAGS.config is None or not hasattr(FLAGS.config, 'train'):
+        raise ValueError('Use --config=config/reinforcement/reinforcement_stepnft.py (or another reinforcement preset)')
     if FLAGS.validate_only:
         loss = FLAGS.config.train.loss_type
         if loss not in ('rollout', 'stepnft'):

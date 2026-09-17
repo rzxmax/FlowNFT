@@ -24,6 +24,8 @@ def run_imitation(config, gpu_id, *, auto=False, action_loss=False, velocity_los
 
 
 def main(_):
+    if FLAGS.config is None or not hasattr(FLAGS.config, 'pretrain'):
+        raise ValueError('Use --config=config/imitation/imitation_state.py (or another imitation preset)')
     if FLAGS.validate_only:
         if FLAGS.action_loss and FLAGS.velocity_loss:
             raise ValueError('--action_loss and --velocity_loss are mutually exclusive')
