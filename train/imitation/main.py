@@ -1,5 +1,7 @@
 """Entry point for demonstration-based Flow/Diffusion pretraining."""
 
+import os
+
 from train.common.bootstrap import configure_gpu
 
 configure_gpu()
@@ -20,6 +22,18 @@ def run_imitation(config, gpu_id, *, auto=False, action_loss=False, velocity_los
         config.pretrain.loss_type = 'action'
     elif velocity_loss:
         config.pretrain.loss_type = 'velocity'
+    project = os.environ.get('WANDB_PROJECT')
+    if project:
+        import wandb
+
+        with wandb.init(
+            project=project,
+            entity=os.environ.get('WANDB_ENTITY') or None,
+            config=config.to_dict(),
+            job_type='imitation',
+            tags=[config.pretrain.obs_mode, config.pretrain.loss_type],
+        ) as run:
+            return pretrain_model(config, gpu_id, wandb_run=run)
     return pretrain_model(config, gpu_id)
 
 

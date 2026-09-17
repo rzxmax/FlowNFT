@@ -40,6 +40,9 @@ python -m train.imitation.main --config=config/imitation/imitation_state.py --gp
 # 点云模仿预训练
 python -m train.imitation.main --config=config/imitation/imitation_pointcloud.py --gpu=0
 
+# 点云训练并上传指标到 545242836-zju/FlowNFT（首次使用需先 wandb login）
+./script/train_pointcloud.sh --gpu=0
+
 # RGB-D 模仿预训练
 python -m train.imitation.main --config=config/imitation/imitation_rgbd.py --gpu=0
 
@@ -56,6 +59,10 @@ python -m train.reinforcement.main \
   --config=config/reinforcement/reinforcement_stepnft.py \
   --pretrain_checkpoint=checkpoints/imitation/<checkpoint>.pth --gpu=0
 ```
+
+点云脚本会把训练指标发送到 W&B 的 `545242836-zju/FlowNFT`。首次运行前，
+使用该账号的 API key 执行 `wandb login`；密钥无需写入脚本或仓库。
+训练期间会记录 batch/epoch 损失、学习率，以及 Auto 模式下的评估结果。
 
 数据与模型权重按用途保存在以下位置（从仓库根目录运行命令）：
 

@@ -15,7 +15,7 @@ from train.common.sampling import _unet_timestep_input
 from train.common.observations import _PCD_HAS_PYTORCH3D, batched_fps_sample
 from train.imitation.evaluator import evaluate_pretrain_model
 
-def pretrain_model(config, gpu_id):
+def pretrain_model(config, gpu_id, wandb_run=None):
     """
     使用成功轨迹对 Flow 策略进行预训练。
 
@@ -492,6 +492,12 @@ def pretrain_model(config, gpu_id):
             global_step += 1
 
             current_lr = optimizer.param_groups[0]['lr']
+            if wandb_run is not None:
+                wandb_run.log({
+                    'train/batch_loss': loss.item(),
+                    'train/learning_rate': current_lr,
+                    'train/epoch': epoch + 1,
+                }, step=global_step, commit=False)
             progress_bar.set_postfix({
                 'Loss': f'{loss.item():.6f}',
                 'LR':   f'{current_lr:.2e}',
@@ -506,6 +512,13 @@ def pretrain_model(config, gpu_id):
         print(f"  平均损失: {avg_loss:.6f}")
         print(f"  当前学习率: {current_lr:.2e}")
         print(f"  EMA状态: {ema_status}")
+        if wandb_run is not None:
+            wandb_run.log({
+                'train/epoch_loss': avg_loss,
+                'train/learning_rate': current_lr,
+            }, step=global_step, commit=not (
+                auto_mode and (epoch + 1) % eval_interval == 0
+            ))
 
         final_epoch = epoch + 1
 
@@ -535,6 +548,11 @@ def pretrain_model(config, gpu_id):
 
             print(f"[Auto模式评估] 成功率: {success_count}/{total_count}")
             print(f"[Auto模式评估] 平均奖励: {avg_reward:.3f}")
+            if wandb_run is not None:
+                wandb_run.log({
+                    'eval/success_rate': success_count / total_count if total_count else 0.0,
+                    'eval/average_reward': avg_reward,
+                }, step=global_step)
 
             if success_count >= success_threshold:
                 print(f"\n{'='*60}")
@@ -626,6 +644,9 @@ def pretrain_model(config, gpu_id):
             }
 
     torch.save(ckpt, checkpoint_path)
+    if wandb_run is not None:
+        wandb_run.summary['checkpoint_path'] = checkpoint_path
+        wandb_run.summary['final_loss'] = avg_loss
 
     print(f"\n预训练完成！")
     print(f"检查点已保存: {checkpoint_path}")

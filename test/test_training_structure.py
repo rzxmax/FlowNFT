@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from config.robot_base import get_config as robot_config
 from config.imitation.imitation_pointcloud import get_config as pointcloud_config
@@ -61,6 +62,26 @@ def test_imitation_dispatch_and_loss_flags(monkeypatch):
         imitation_main.run_imitation(
             config, 2, action_loss=True, velocity_loss=True
         )
+
+
+def test_imitation_wandb_tracking(monkeypatch):
+    import wandb
+
+    config = pointcloud_config()
+    run = MagicMock()
+    tracker = MagicMock()
+    tracker.__enter__.return_value = run
+    init = MagicMock(return_value=tracker)
+    train = MagicMock(return_value='checkpoint.pth')
+    monkeypatch.setenv('WANDB_PROJECT', 'FlowNFT')
+    monkeypatch.setenv('WANDB_ENTITY', '545242836-zju')
+    monkeypatch.setattr(wandb, 'init', init)
+    monkeypatch.setattr(imitation_main, 'pretrain_model', train)
+
+    assert imitation_main.run_imitation(config, 0) == 'checkpoint.pth'
+    assert init.call_args.kwargs['project'] == 'FlowNFT'
+    assert init.call_args.kwargs['entity'] == '545242836-zju'
+    assert train.call_args.kwargs['wandb_run'] is run
 
 
 def test_stage_entrypoints_dispatch(monkeypatch):

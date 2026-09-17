@@ -20,4 +20,5 @@ def get_config():
     pretrain.pcd_use_layernorm = True
     pretrain.pcd_final_norm = 'layernorm'
     pretrain.pcd_max_pts = 4096
+    pretrain.checkpoint_dir = 'checkpoints/imitation/pointcloud'
     return config

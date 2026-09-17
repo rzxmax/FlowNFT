@@ -30,12 +30,6 @@ checkpoints/
 *.onnx
 
 # 数据集
-data/
-/episodes
-mn_dataset/
-benchmark/
-CompoSuite/
-ManiSkill/
 *.zarr
 *.hdf5
 *.h5
