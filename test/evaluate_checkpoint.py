@@ -573,6 +573,7 @@ def evaluate_checkpoint(
     action_horizon=ROBOT_CONFIG.action_horizon,
     render=False,
     gpu_id=0,
+    sim_backend=None,
     train_episode_ids_file="",  # 训练集episode_ids文件路径
     test_mode="random",         # "random" / "train_set" / "compare" / "custom"
     train_epochs=None,          # 只使用前N个epoch的episode_ids，None表示使用全部
@@ -591,6 +592,7 @@ def evaluate_checkpoint(
         action_horizon: 动作序列长度
         render: 是否保存视频（带timestep和reward显示）
         gpu_id: 使用的GPU ID
+        sim_backend: 可选的 ManiSkill 仿真后端；默认使用 checkpoint 配置
         train_episode_ids_file: JSON文件路径，包含训练时采样的episode_ids
         test_mode: 测试模式
             "random"    - 仅测试随机验证集（原始行为）
@@ -805,7 +807,7 @@ def evaluate_checkpoint(
         env_obs_mode = 'state'
     saved_env_kwargs = saved_config.get('env_kwargs', {})
     env_kwargs = {
-        'sim_backend': saved_env_kwargs.get('sim_backend', 'gpu'),
+        'sim_backend': sim_backend or saved_env_kwargs.get('sim_backend', 'gpu'),
         'control_mode': saved_env_kwargs.get('control_mode', 'pd_ee_delta_pos'),
         'obs_mode': env_obs_mode,
         'render_mode': 'rgb_array',
@@ -1087,6 +1089,9 @@ def main():
                        help='保存视频（会在视频中显示timestep和reward）')
     parser.add_argument('--gpu', type=int, default=0,
                        help='使用的GPU ID')
+    parser.add_argument('--sim_backend', type=str, default=None,
+                       choices=['gpu', 'physx_cpu'],
+                       help='覆盖 checkpoint 中的仿真后端，便于和演示数据对照')
     parser.add_argument('--save_results', type=str, default='',
                        help='保存结果的JSON文件路径')
     parser.add_argument('--train_episode_ids_file', type=str, default='',
@@ -1132,6 +1137,7 @@ def main():
         action_horizon=args.action_horizon,
         render=args.render,
         gpu_id=args.gpu,
+        sim_backend=args.sim_backend,
         train_episode_ids_file=args.train_episode_ids_file,
         test_mode=args.test_mode,
         train_epochs=args.train_epochs,

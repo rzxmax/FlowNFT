@@ -60,11 +60,6 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     print(f"每个 H5 最多读取 episodes: {config.pretrain.num_episodes}")
     print(f"训练 epochs: {config.pretrain.num_epochs}")
 
-    # Allow every demonstrated step to start a window. Missing tail steps
-    # repeat the final observation, command zero translation, and hold the
-    # final gripper command.
-    tail_padding = config.action_horizon - 1
-
     # ------------------------------------------------------------------
     # 1. 加载数据集
     # ------------------------------------------------------------------
@@ -83,7 +78,6 @@ def pretrain_model(config, gpu_id, wandb_run=None):
             h5_path=dataset_paths,
             horizon=config.action_horizon,
             pad_before=0,
-            pad_after=tail_padding,
             val_ratio=0.0,
             max_episodes=config.pretrain.num_episodes,
             max_episodes_per_file=True,
@@ -135,7 +129,6 @@ def pretrain_model(config, gpu_id, wandb_run=None):
             h5_path=dataset_paths,
             horizon=config.action_horizon,
             pad_before=0,
-            pad_after=tail_padding,
             val_ratio=0.0,
             max_episodes=config.pretrain.num_episodes,
             max_episodes_per_file=True,
@@ -173,7 +166,6 @@ def pretrain_model(config, gpu_id, wandb_run=None):
             h5_path=dataset_paths,
             horizon=config.action_horizon,
             pad_before=0,
-            pad_after=tail_padding,
             val_ratio=0.0,
             max_episodes=config.pretrain.num_episodes,
             max_episodes_per_file=True,

@@ -32,20 +32,19 @@ def _trajectory_keys(h5):
 class ManiSkillReplayDataset(Dataset):
     """Map replay H5 trajectories to fixed-length action windows.
 
-    An observation at index t is paired with actions[t]. Tail observations
-    repeat the last valid observation. Padded Panda pd_ee_delta_pos actions
-    command zero translation while retaining the last valid gripper command.
+    An observation at index t is paired with actions[t]. Only complete action
+    windows are sampled; optional leading padding repeats the first frame.
     H5 handles are opened inside each DataLoader worker, never serialized into
     worker processes.
     """
 
     obs_key = None
 
-    def __init__(self, h5_path, horizon=1, pad_before=0, pad_after=0,
+    def __init__(self, h5_path, horizon=1, pad_before=0,
                  seed=42, val_ratio=0.0, max_episodes=None, success_only=True,
                  max_episodes_per_file=False):
-        if horizon < 1 or pad_before < 0 or pad_after < 0:
-            raise ValueError("horizon must be positive and padding nonnegative")
+        if horizon < 1 or pad_before < 0:
+            raise ValueError("horizon must be positive and leading padding nonnegative")
         paths = self._resolve_paths(h5_path)
         self.episodes = []
         self.action_dim = None
@@ -75,7 +74,10 @@ class ManiSkillReplayDataset(Dataset):
                         completed = np.empty(0, dtype=np.int64)
                     if success_only and not len(completed):
                         continue
-                    length = int(completed[0]) + 1 if len(completed) else len(actions)
+                    # Successful replays can continue for several steps after the
+                    # first success. Keep the recorded trajectory, as the former
+                    # split-episode dataset did, so final corrections are trained.
+                    length = len(actions)
                     if length == 0:
                         continue
                     obs_len = len(self._observation_dataset(group))
@@ -97,7 +99,6 @@ class ManiSkillReplayDataset(Dataset):
 
         self.horizon = int(horizon)
         self.pad_before = min(int(pad_before), self.horizon - 1)
-        self.pad_after = min(int(pad_after), self.horizon - 1)
         self._files = {}
         self._stats = None
         self._seed = seed
@@ -137,7 +138,7 @@ class ManiSkillReplayDataset(Dataset):
         total = 0
         for i in self._selected:
             length = self.episodes[i].length
-            total += max(0, length - self.horizon + 1 + self.pad_before + self.pad_after)
+            total += max(0, length - self.horizon + 1 + self.pad_before)
             self._counts.append(total)
 
     def get_validation_dataset(self):
@@ -177,7 +178,7 @@ class ManiSkillReplayDataset(Dataset):
             handle = entry[1]
         return handle[episode.key] if episode.key is not None else handle
 
-    def _window(self, index, with_tail_mask=False):
+    def _window(self, index):
         if index < 0:
             index += len(self)
         if index < 0 or index >= len(self):
@@ -187,15 +188,12 @@ class ManiSkillReplayDataset(Dataset):
         episode = self.episodes[self._selected[selected_idx]]
         start = index - previous - self.pad_before
         positions = np.arange(start, start + self.horizon)
-        indices = np.clip(positions, 0, episode.length - 1)
-        if with_tail_mask:
-            return episode, indices, positions >= episode.length
-        return episode, indices
+        return episode, np.clip(positions, 0, episode.length - 1)
 
     @staticmethod
     def _read(dataset, indices):
         # HDF5 fancy indexing requires increasing indices; one contiguous read
-        # also handles repeated boundary frames used for padding.
+        # also handles repeated leading frames.
         first, last = int(indices[0]), int(indices[-1]) + 1
         return np.asarray(dataset[first:last])[indices - first]
 
@@ -206,15 +204,10 @@ class ManiSkillReplayDataset(Dataset):
         raise NotImplementedError
 
     def __getitem__(self, index):
-        episode, indices, tail_mask = self._window(index, with_tail_mask=True)
+        episode, indices = self._window(index)
         group = self._group(episode)
         sample = self._sample(group, indices, index)
-        actions = self._read(group["actions"], indices).astype(np.float32)
-        if tail_mask.any():
-            if actions.shape[1] != 4:
-                raise ValueError("Zero-translation tail padding requires 4-D pd_ee_delta_pos actions")
-            actions[tail_mask, :3] = 0.0
-        sample["action"] = actions
+        sample["action"] = self._read(group["actions"], indices).astype(np.float32)
         return {key: torch.from_numpy(np.ascontiguousarray(value)) for key, value in sample.items()}
 
     def _normalizer_data(self):

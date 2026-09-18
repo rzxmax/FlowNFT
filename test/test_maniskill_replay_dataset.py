@@ -37,7 +37,7 @@ def replay_h5(tmp_path):
     return path
 
 
-def test_state_alignment_success_and_padding(replay_h5):
+def test_state_alignment_keeps_actions_after_first_success(replay_h5):
     # The state reader requires the flat obs layout used by state replay.
     with h5py.File(replay_h5, "r+") as h5:
         for key in h5:
@@ -49,14 +49,16 @@ def test_state_alignment_success_and_padding(replay_h5):
             h5[key].move("flat_obs", "obs")
     ds = ManiSkillStateDataset(replay_h5, horizon=2, pad_before=1)
     assert len(ds.episodes) == 1
-    assert len(ds) == 3
+    assert len(ds) == 4
     np.testing.assert_array_equal(ds[0]["obs"].numpy().ravel(), [0, 0])
     np.testing.assert_array_equal(ds[2]["action"].numpy()[:, 0], [1, 2])
+    np.testing.assert_array_equal(ds[-1]["action"].numpy()[:, 0], [2, 3])
+    assert ds.get_normalizer()["action"].get_input_stats()["max"][0].item() == 3
     assert next(iter(DataLoader(ds, batch_size=2, num_workers=2)))["obs"].shape == (2, 2, 1)
 
 
 @pytest.mark.parametrize("length", [3, 4, 5])
-def test_state_tail_padding_keeps_every_step_as_window_start(tmp_path, length):
+def test_state_windows_require_full_horizon(tmp_path, length):
     path = tmp_path / "state.h5"
     with h5py.File(path, "w") as h5:
         group = h5.create_group("traj_0")
@@ -68,15 +70,14 @@ def test_state_tail_padding_keeps_every_step_as_window_start(tmp_path, length):
         group.create_dataset("actions", data=actions)
         group.create_dataset("success", data=[False] * (length - 1) + [True])
 
-    tail = ManiSkillStateDataset(path, horizon=4, pad_after=3)
-    assert len(tail) == length
-    np.testing.assert_array_equal(tail[-1]["action"].numpy()[0], actions[-1])
-    np.testing.assert_array_equal(tail[-1]["action"].numpy()[1:],
-                                  np.tile([0, 0, 0, -1], (3, 1)))
-    np.testing.assert_array_equal(tail[-1]["obs"].numpy()[:, 0], [length - 1] * 4)
-    np.testing.assert_array_equal(tail[-2]["action"].numpy()[:2], actions[-2:])
-    np.testing.assert_array_equal(tail[-2]["action"].numpy()[2:],
-                                  np.tile([0, 0, 0, -1], (2, 1)))
+    dataset = ManiSkillStateDataset(path, horizon=4)
+    assert len(dataset) == max(0, length - 3)
+    if len(dataset):
+        np.testing.assert_array_equal(dataset[-1]["action"].numpy(), actions[-4:])
+        np.testing.assert_array_equal(dataset[-1]["obs"].numpy()[:, 0],
+                                      np.arange(length - 4, length))
+        assert sum(np.array_equal(dataset[i]["action"].numpy()[-1], actions[-1])
+                   for i in range(len(dataset))) == 1
 
 
 def test_rgbd_and_pointcloud_from_replay(replay_h5):
@@ -101,8 +102,7 @@ def test_rgbd_and_pointcloud_from_replay(replay_h5):
         (ManiSkillImageDataset, {"obs_steps": 2}),
         (ManiSkillPointCloudDataset, {"obs_steps": 2, "max_pts": 4}),
     ):
-        tail = dataset_type(replay_h5, horizon=4, pad_after=3, **kwargs)
-        assert len(tail) == 3
-        np.testing.assert_array_equal(tail[-1]["action"].numpy()[0], [2, 2, 2, 2])
-        np.testing.assert_array_equal(tail[-1]["action"].numpy()[1:],
-                                      np.tile([0, 0, 0, 2], (3, 1)))
+        dataset = dataset_type(replay_h5, horizon=3, **kwargs)
+        assert len(dataset) == 2
+        np.testing.assert_array_equal(dataset[0]["action"].numpy()[:, 0], [0, 1, 2])
+        np.testing.assert_array_equal(dataset[-1]["action"].numpy()[:, 0], [1, 2, 3])

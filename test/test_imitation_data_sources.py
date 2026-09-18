@@ -29,14 +29,14 @@ def test_manifest_loads_multiple_files_and_caps_each_file(tmp_path):
     paths = load_dataset_paths(manifest)
     assert paths == [str(first), str(second)]
     dataset = ManiSkillStateDataset(
-        paths, horizon=4, pad_after=3, max_episodes=1,
+        paths, horizon=3, max_episodes=1,
         max_episodes_per_file=True,
     )
     assert len(dataset.episodes) == 2
-    assert len(dataset) == 6
+    assert len(dataset) == 2
     assert [episode.path for episode in dataset.episodes] == paths
     np.testing.assert_array_equal(dataset[0]['action'].numpy()[0], [1] * 4)
-    np.testing.assert_array_equal(dataset[3]['action'].numpy()[0], [2] * 4)
+    np.testing.assert_array_equal(dataset[1]['action'].numpy()[0], [2] * 4)
 
 
 @pytest.mark.parametrize('contents', [[], {'datasets': []}, {'datasets': [42]}])
