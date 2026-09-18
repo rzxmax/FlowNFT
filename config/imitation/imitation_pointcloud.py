@@ -7,10 +7,7 @@ def get_config():
     config = get_base_config()
     config.pretrain.obs_mode = 'pointcloud'
     config.env_kwargs.obs_mode = 'pointcloud'
-    config.pretrain.dataset_path = (
-        '~/.maniskill/demos/PickCube-v1/motionplanning/'
-        'trajectory.pointcloud.pd_ee_delta_pos.physx_cpu.h5'
-    )
+    config.pretrain.dataset_path = 'config/imitation/datasets_pointcloud.json'
     pretrain = config.pretrain
     pretrain.pcd_n_obs_steps = 2
     pretrain.pcd_n_points = 512

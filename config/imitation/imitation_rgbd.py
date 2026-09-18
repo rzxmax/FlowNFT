@@ -7,10 +7,7 @@ def get_config():
     config = get_base_config()
     config.pretrain.obs_mode = 'image'
     config.env_kwargs.obs_mode = 'rgbd'
-    config.pretrain.dataset_path = (
-        '~/.maniskill/demos/PickCube-v1/motionplanning/'
-        'trajectory.rgbd.pd_ee_delta_pos.physx_cpu.h5'
-    )
+    config.pretrain.dataset_path = 'config/imitation/datasets_rgbd.json'
     pretrain = config.pretrain
     pretrain.img_n_obs_steps = 2
     pretrain.img_camera = 'base_camera'

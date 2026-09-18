@@ -1,0 +1,5 @@
+{
+  "datasets": [
+    "~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.rgbd.pd_ee_delta_pos.physx_cpu.h5"
+  ]
+}

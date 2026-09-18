@@ -88,10 +88,26 @@ data/datasets/
 ```
 
 模仿训练的数据读取器位于 `dataset/`，直接从 ManiSkill replay 生成的 H5
-按需读取轨迹。`config/imitation/imitation_pointcloud.py` 与 `config/imitation/imitation_rgbd.py`
-的 `pretrain.dataset_path` 默认指向 `~/.maniskill/demos/PickCube-v1/motionplanning/`
-下各自的 replay H5。state 配置目前使用已有的 episode 目录；取得带
-`obs_mode=state` 的 replay H5 后，也可把同一配置项改为该 H5 路径。
+按需读取轨迹。三个模仿预设的 `pretrain.dataset_path` 分别指向
+`config/imitation/datasets_state.json`、`datasets_pointcloud.json` 和
+`datasets_rgbd.json`。在对应清单的 `datasets` 数组中加入更多 H5，即可
+按顺序加载多个数据源。例如点云清单：
+
+```json
+{
+  "datasets": [
+    "~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.pointcloud.pd_ee_delta_pos.physx_cpu.h5",
+    "~/.maniskill/demos/OtherTask-v1/motionplanning/trajectory.pointcloud.pd_ee_delta_pos.physx_cpu.h5"
+  ]
+}
+```
+
+清单也可以直接是路径字符串数组。`~` 会展开为用户目录，相对路径以清单所在
+目录为基准。`pretrain.num_episodes` 限制**每个 H5** 读取的成功 episode 数，
+归一化统计由所有已加载轨迹共同计算。当前联合加载要求各 H5 的观测维度和
+动作维度与所选预设一致；完整的多任务评估和任务条件输入尚未加入。
+预训练的末尾窗口按 `action_horizon - 1` 补齐：观测重复最后一个有效观测，
+补出的 `pd_ee_delta_pos` 动作前三维为零，第 4 维沿用最后的夹爪指令。
 最初下载的 `trajectory.h5` 没有训练所需的观测，且动作控制模式不同，
 不能直接作为这些配置的数据源。
 

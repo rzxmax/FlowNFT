@@ -41,6 +41,7 @@ checkpoints/
 
 # 视频与图像输出
 videos/
+test_videos/
 *.mp4
 *.avi
 *.gif

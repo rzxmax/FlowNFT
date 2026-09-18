@@ -55,6 +55,30 @@ def test_state_alignment_success_and_padding(replay_h5):
     assert next(iter(DataLoader(ds, batch_size=2, num_workers=2)))["obs"].shape == (2, 2, 1)
 
 
+@pytest.mark.parametrize("length", [3, 4, 5])
+def test_state_tail_padding_keeps_every_step_as_window_start(tmp_path, length):
+    path = tmp_path / "state.h5"
+    with h5py.File(path, "w") as h5:
+        group = h5.create_group("traj_0")
+        group.create_dataset("obs", data=np.arange(length + 1, dtype=np.float32)[:, None])
+        actions = np.column_stack((
+            np.repeat(np.arange(length, dtype=np.float32)[:, None], 3, axis=1),
+            -np.ones(length, dtype=np.float32),
+        ))
+        group.create_dataset("actions", data=actions)
+        group.create_dataset("success", data=[False] * (length - 1) + [True])
+
+    tail = ManiSkillStateDataset(path, horizon=4, pad_after=3)
+    assert len(tail) == length
+    np.testing.assert_array_equal(tail[-1]["action"].numpy()[0], actions[-1])
+    np.testing.assert_array_equal(tail[-1]["action"].numpy()[1:],
+                                  np.tile([0, 0, 0, -1], (3, 1)))
+    np.testing.assert_array_equal(tail[-1]["obs"].numpy()[:, 0], [length - 1] * 4)
+    np.testing.assert_array_equal(tail[-2]["action"].numpy()[:2], actions[-2:])
+    np.testing.assert_array_equal(tail[-2]["action"].numpy()[2:],
+                                  np.tile([0, 0, 0, -1], (2, 1)))
+
+
 def test_rgbd_and_pointcloud_from_replay(replay_h5):
     image = ManiSkillImageDataset(replay_h5, horizon=3, obs_steps=2, depth_max=5)
     sample = image[0]
@@ -72,3 +96,13 @@ def test_rgbd_and_pointcloud_from_replay(replay_h5):
     np.testing.assert_array_equal(sample["valid_count"], [1, 1])
     np.testing.assert_array_equal(sample["point_cloud"][0, 0], [1, 2, 3])
     np.testing.assert_array_equal(sample["point_cloud"][0, 1:], 0)
+
+    for dataset_type, kwargs in (
+        (ManiSkillImageDataset, {"obs_steps": 2}),
+        (ManiSkillPointCloudDataset, {"obs_steps": 2, "max_pts": 4}),
+    ):
+        tail = dataset_type(replay_h5, horizon=4, pad_after=3, **kwargs)
+        assert len(tail) == 3
+        np.testing.assert_array_equal(tail[-1]["action"].numpy()[0], [2, 2, 2, 2])
+        np.testing.assert_array_equal(tail[-1]["action"].numpy()[1:],
+                                      np.tile([0, 0, 0, 2], (3, 1)))

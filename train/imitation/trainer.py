@@ -14,6 +14,7 @@ from train.common.runtime import (
 from train.common.sampling import _unet_timestep_input
 from train.common.observations import _PCD_HAS_PYTORCH3D, batched_fps_sample
 from train.imitation.checkpoint_files import create_run_dir, checkpoint_path, prune_checkpoints
+from train.imitation.data_sources import load_dataset_paths
 from train.imitation.evaluator import evaluate_pretrain_model
 
 def pretrain_model(config, gpu_id, wandb_run=None):
@@ -51,9 +52,18 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     print(f"Loss 类型: {pretrain_loss_type}"
           + ("  (multi-step rollout MSE)" if pretrain_loss_type == "action"
              else "  (Flow Matching velocity MSE)"))
-    print(f"数据集路径: {config.pretrain.dataset_path}")
-    print(f"训练 episodes: {config.pretrain.num_episodes}")
+    dataset_paths = load_dataset_paths(config.pretrain.dataset_path)
+    print(f"数据集清单: {config.pretrain.dataset_path}")
+    print(f"H5 文件数: {len(dataset_paths)}")
+    for path in dataset_paths:
+        print(f"  - {path}")
+    print(f"每个 H5 最多读取 episodes: {config.pretrain.num_episodes}")
     print(f"训练 epochs: {config.pretrain.num_epochs}")
+
+    # Allow every demonstrated step to start a window. Missing tail steps
+    # repeat the final observation, command zero translation, and hold the
+    # final gripper command.
+    tail_padding = config.action_horizon - 1
 
     # ------------------------------------------------------------------
     # 1. 加载数据集
@@ -70,12 +80,13 @@ def pretrain_model(config, gpu_id, wandb_run=None):
         pcd_final_norm     = getattr(config.pretrain, 'pcd_final_norm', 'layernorm')
 
         dataset = ManiSkillPointCloudDataset(
-            h5_path=config.pretrain.dataset_path,
+            h5_path=dataset_paths,
             horizon=config.action_horizon,
             pad_before=0,
-            pad_after=0,
+            pad_after=tail_padding,
             val_ratio=0.0,
             max_episodes=config.pretrain.num_episodes,
+            max_episodes_per_file=True,
             max_pts=getattr(config.pretrain, 'pcd_max_pts', 4096),
             obs_steps=pcd_n_obs_steps,
         )
@@ -121,12 +132,13 @@ def pretrain_model(config, gpu_id, wandb_run=None):
         img_use_groupnorm   = bool(getattr(config.pretrain, 'img_use_groupnorm', True))
 
         dataset = ManiSkillImageDataset(
-            h5_path=config.pretrain.dataset_path,
+            h5_path=dataset_paths,
             horizon=config.action_horizon,
             pad_before=0,
-            pad_after=0,
+            pad_after=tail_padding,
             val_ratio=0.0,
             max_episodes=config.pretrain.num_episodes,
+            max_episodes_per_file=True,
             camera=img_camera,
             use_depth=img_use_depth,
             depth_max=img_depth_max,
@@ -158,12 +170,13 @@ def pretrain_model(config, gpu_id, wandb_run=None):
         from dataset import ManiSkillStateDataset
 
         dataset = ManiSkillStateDataset(
-            h5_path=config.pretrain.dataset_path,
+            h5_path=dataset_paths,
             horizon=config.action_horizon,
             pad_before=0,
-            pad_after=0,
+            pad_after=tail_padding,
             val_ratio=0.0,
             max_episodes=config.pretrain.num_episodes,
+            max_episodes_per_file=True,
         )
 
         obs_dim    = dataset.obs_dim
@@ -177,6 +190,9 @@ def pretrain_model(config, gpu_id, wandb_run=None):
         print(f"  动作维度: {action_dim}")
         print(f"  样本数: {len(dataset)}")
         print(f"  归一化器: obs + action（limits 模式）")
+
+    training_episode_count = len(dataset.episodes)
+    print(f"实际加载 episodes: {training_episode_count}")
 
     dataloader = DataLoader(
         dataset,
@@ -370,7 +386,7 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     run_dir = create_run_dir(
         config.pretrain.checkpoint_dir,
         epochs=max_epochs,
-        episodes=config.pretrain.num_episodes,
+        episodes=training_episode_count,
         obs_mode=obs_mode,
         auto_mode=auto_mode,
     )
@@ -386,7 +402,7 @@ def pretrain_model(config, gpu_id, wandb_run=None):
 
     def save_checkpoint(epoch_number, loss, stopped=False):
         path = checkpoint_path(
-            run_dir, epoch=epoch_number, episodes=config.pretrain.num_episodes,
+            run_dir, epoch=epoch_number, episodes=training_episode_count,
             obs_mode=obs_mode, auto_mode=auto_mode,
         )
         unet_state = ema_state_dict(action_unet, ema_unet)
@@ -404,6 +420,8 @@ def pretrain_model(config, gpu_id, wandb_run=None):
             'ema_decoder_state_dict':     ema_decoder.state_dict() if ema_decoder is not None else None,
             'loss':                       loss,
             'config':                     config.to_dict(),
+            'dataset_paths':              dataset_paths,
+            'training_episode_count':     training_episode_count,
             'obs_dim':                    obs_dim,
             'action_dim':                 action_dim,
             'auto_mode':                  auto_mode,
@@ -445,7 +463,7 @@ def pretrain_model(config, gpu_id, wandb_run=None):
             if temporary_path.exists():
                 temporary_path.unlink()
         prune_checkpoints(
-            run_dir, episodes=config.pretrain.num_episodes,
+            run_dir, episodes=training_episode_count,
             obs_mode=obs_mode, auto_mode=auto_mode, keep=checkpoint_keep,
         )
         if wandb_run is not None:
@@ -681,7 +699,7 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     else:
         print(f"  训练模式: 固定 ({final_epoch} epochs)")
     print(f"  观测模式: {obs_mode}")
-    print(f"  使用 episodes: {config.pretrain.num_episodes}")
+    print(f"  使用 episodes: {training_episode_count}")
     print(f"  包含 EMA 权重: ✓")
     print(f"  包含优化器状态: ✓")
     print(f"  包含学习率调度器: ✓")

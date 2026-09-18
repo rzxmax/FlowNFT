@@ -32,14 +32,18 @@ def _trajectory_keys(h5):
 class ManiSkillReplayDataset(Dataset):
     """Map replay H5 trajectories to fixed-length action windows.
 
-    An observation at index t is paired with actions[t]. H5 handles are opened
-    inside each DataLoader worker, never serialized into worker processes.
+    An observation at index t is paired with actions[t]. Tail observations
+    repeat the last valid observation. Padded Panda pd_ee_delta_pos actions
+    command zero translation while retaining the last valid gripper command.
+    H5 handles are opened inside each DataLoader worker, never serialized into
+    worker processes.
     """
 
     obs_key = None
 
     def __init__(self, h5_path, horizon=1, pad_before=0, pad_after=0,
-                 seed=42, val_ratio=0.0, max_episodes=None, success_only=True):
+                 seed=42, val_ratio=0.0, max_episodes=None, success_only=True,
+                 max_episodes_per_file=False):
         if horizon < 1 or pad_before < 0 or pad_after < 0:
             raise ValueError("horizon must be positive and padding nonnegative")
         paths = self._resolve_paths(h5_path)
@@ -47,6 +51,7 @@ class ManiSkillReplayDataset(Dataset):
         self.action_dim = None
         self.obs_dim = None
         for path in paths:
+            file_episodes = 0
             with h5py.File(path, "r") as h5:
                 for key in _trajectory_keys(h5):
                     group = h5[key] if key is not None else h5
@@ -77,9 +82,15 @@ class ManiSkillReplayDataset(Dataset):
                     if obs_len < length:
                         raise ValueError(f"{path}:{key}: observations shorter than actions")
                     self.episodes.append(Episode(str(path), key, length))
-                    if max_episodes is not None and len(self.episodes) >= max_episodes:
+                    file_episodes += 1
+                    if (max_episodes is not None and max_episodes_per_file
+                            and file_episodes >= max_episodes):
                         break
-            if max_episodes is not None and len(self.episodes) >= max_episodes:
+                    if (max_episodes is not None and not max_episodes_per_file
+                            and len(self.episodes) >= max_episodes):
+                        break
+            if (max_episodes is not None and not max_episodes_per_file
+                    and len(self.episodes) >= max_episodes):
                 break
         if not self.episodes:
             raise ValueError(f"No usable episodes in {h5_path}")
@@ -166,7 +177,7 @@ class ManiSkillReplayDataset(Dataset):
             handle = entry[1]
         return handle[episode.key] if episode.key is not None else handle
 
-    def _window(self, index):
+    def _window(self, index, with_tail_mask=False):
         if index < 0:
             index += len(self)
         if index < 0 or index >= len(self):
@@ -175,7 +186,11 @@ class ManiSkillReplayDataset(Dataset):
         previous = self._counts[selected_idx - 1] if selected_idx else 0
         episode = self.episodes[self._selected[selected_idx]]
         start = index - previous - self.pad_before
-        return episode, np.clip(np.arange(start, start + self.horizon), 0, episode.length - 1)
+        positions = np.arange(start, start + self.horizon)
+        indices = np.clip(positions, 0, episode.length - 1)
+        if with_tail_mask:
+            return episode, indices, positions >= episode.length
+        return episode, indices
 
     @staticmethod
     def _read(dataset, indices):
@@ -191,10 +206,15 @@ class ManiSkillReplayDataset(Dataset):
         raise NotImplementedError
 
     def __getitem__(self, index):
-        episode, indices = self._window(index)
+        episode, indices, tail_mask = self._window(index, with_tail_mask=True)
         group = self._group(episode)
         sample = self._sample(group, indices, index)
-        sample["action"] = self._read(group["actions"], indices).astype(np.float32)
+        actions = self._read(group["actions"], indices).astype(np.float32)
+        if tail_mask.any():
+            if actions.shape[1] != 4:
+                raise ValueError("Zero-translation tail padding requires 4-D pd_ee_delta_pos actions")
+            actions[tail_mask, :3] = 0.0
+        sample["action"] = actions
         return {key: torch.from_numpy(np.ascontiguousarray(value)) for key, value in sample.items()}
 
     def _normalizer_data(self):
