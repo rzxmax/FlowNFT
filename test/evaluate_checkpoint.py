@@ -569,7 +569,7 @@ def evaluate_checkpoint(
     num_episodes=10,
     num_inference_steps=None,
     deterministic=True,  # ✅ DiffusionNFT: 默认使用ODE确定性模式
-    max_steps=500,
+    max_steps=300,
     action_horizon=ROBOT_CONFIG.action_horizon,
     render=False,
     gpu_id=0,
@@ -813,7 +813,9 @@ def evaluate_checkpoint(
     }
     
     print(f"\n创建环境: {env_id}")
-    base_env = gym.make(env_id, reconfiguration_freq=1, **env_kwargs)
+    base_env = gym.make(
+        env_id, reconfiguration_freq=1, max_episode_steps=max_steps, **env_kwargs
+    )
     
     # 如果需要录制视频
     if render:
@@ -1077,7 +1079,7 @@ def main():
                        help='推理步数；默认读取 checkpoint，旧 checkpoint 默认 10')
     parser.add_argument('--deterministic', action='store_true', default=True,
                        help='使用确定性ODE生成（DiffusionNFT方法，默认开启）')
-    parser.add_argument('--max_steps', type=int, default=500,
+    parser.add_argument('--max_steps', type=int, default=300,
                        help='每个episode的最大步数')
     parser.add_argument('--action_horizon', type=int, default=ROBOT_CONFIG.action_horizon,
                        help='动作序列长度（与训练配置一致）')

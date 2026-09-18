@@ -13,6 +13,7 @@ from train.common.runtime import (
 
 from train.common.sampling import _unet_timestep_input
 from train.common.observations import _PCD_HAS_PYTORCH3D, batched_fps_sample
+from train.imitation.checkpoint_files import create_run_dir, checkpoint_path, prune_checkpoints
 from train.imitation.evaluator import evaluate_pretrain_model
 
 def pretrain_model(config, gpu_id, wandb_run=None):
@@ -362,6 +363,97 @@ def pretrain_model(config, gpu_id, wandb_run=None):
         max_epochs = config.pretrain.num_epochs
         print(f"[固定模式] 训练 {max_epochs} epochs")
 
+    checkpoint_interval = int(getattr(config.pretrain, 'checkpoint_interval', 50))
+    checkpoint_keep = int(getattr(config.pretrain, 'checkpoint_keep', 3))
+    if checkpoint_interval < 1 or checkpoint_keep < 1:
+        raise ValueError('checkpoint_interval 和 checkpoint_keep 必须至少为 1')
+    run_dir = create_run_dir(
+        config.pretrain.checkpoint_dir,
+        epochs=max_epochs,
+        episodes=config.pretrain.num_episodes,
+        obs_mode=obs_mode,
+        auto_mode=auto_mode,
+    )
+    print(f"检查点目录: {run_dir}（每 {checkpoint_interval} epochs 保存，保留最新 {checkpoint_keep} 个）")
+
+    def ema_state_dict(model, ema):
+        """Use EMA parameters without replacing the weights used by the next epoch."""
+        state = model.state_dict()
+        if ema is not None:
+            for (name, _), shadow in zip(model.named_parameters(), ema.shadow_params):
+                state[name] = shadow
+        return state
+
+    def save_checkpoint(epoch_number, loss, stopped=False):
+        path = checkpoint_path(
+            run_dir, epoch=epoch_number, episodes=config.pretrain.num_episodes,
+            obs_mode=obs_mode, auto_mode=auto_mode,
+        )
+        unet_state = ema_state_dict(action_unet, ema_unet)
+        ckpt = {
+            'epoch':                      epoch_number - 1,
+            'obs_mode':                   obs_mode,
+            'pretrain_loss_type':         pretrain_loss_type,
+            'decoder_trained':            decoder_trains_in_pretrain,
+            'model_state_dict':           unet_state,
+            'action_unet_state_dict':     unet_state,
+            'action_decoder_state_dict':  ema_state_dict(action_decoder, ema_decoder),
+            'optimizer_state_dict':       optimizer.state_dict(),
+            'lr_scheduler_state_dict':    lr_scheduler.state_dict() if lr_scheduler is not None else None,
+            'ema_unet_state_dict':        ema_unet.state_dict(),
+            'ema_decoder_state_dict':     ema_decoder.state_dict() if ema_decoder is not None else None,
+            'loss':                       loss,
+            'config':                     config.to_dict(),
+            'obs_dim':                    obs_dim,
+            'action_dim':                 action_dim,
+            'auto_mode':                  auto_mode,
+            'training_stopped':           stopped if auto_mode else False,
+            'normalizer_state_dict':      normalizer.state_dict(),
+        }
+        if obs_encoder is not None:
+            ckpt['obs_encoder_state_dict'] = ema_state_dict(obs_encoder, ema_obs_encoder)
+            ckpt['ema_obs_encoder_state_dict'] = ema_obs_encoder.state_dict()
+            if obs_mode == 'pointcloud':
+                ckpt['pcd_encoder_config'] = {
+                    'n_obs_steps': pcd_n_obs_steps,
+                    'pcd_out_dim': pcd_enc_out_dim,
+                    'agent_pos_dim': pcd_agent_pos_dim,
+                    'state_mlp_out': pcd_state_mlp_out,
+                    'use_layernorm': pcd_use_layernorm,
+                    'final_norm': pcd_final_norm,
+                }
+            elif obs_mode == 'image':
+                ckpt['img_encoder_config'] = {
+                    'n_obs_steps': img_n_obs_steps,
+                    'in_channels': img_in_channels,
+                    'resnet_name': img_resnet_name,
+                    'img_feat_dim': img_resnet_feat_dim,
+                    'agent_pos_dim': img_agent_pos_dim,
+                    'state_mlp_out': img_state_mlp_out,
+                    'use_groupnorm': img_use_groupnorm,
+                    'camera': img_camera,
+                    'use_depth': img_use_depth,
+                    'depth_max': img_depth_max,
+                }
+
+        # Only prune after the new file is fully written.
+        temporary_path = path.with_suffix('.pth.tmp')
+        try:
+            torch.save(ckpt, temporary_path)
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        prune_checkpoints(
+            run_dir, episodes=config.pretrain.num_episodes,
+            obs_mode=obs_mode, auto_mode=auto_mode, keep=checkpoint_keep,
+        )
+        if wandb_run is not None:
+            wandb_run.summary['checkpoint_path'] = str(path)
+            wandb_run.summary['final_loss'] = loss
+        print(f"检查点已保存: {path}")
+        return str(path)
+
     action_unet.train()
     action_decoder.train()
     if obs_encoder is not None:
@@ -522,6 +614,9 @@ def pretrain_model(config, gpu_id, wandb_run=None):
 
         final_epoch = epoch + 1
 
+        if final_epoch % checkpoint_interval == 0:
+            checkpoint_path_saved = save_checkpoint(final_epoch, avg_loss)
+
         # Auto 模式：定期评估（state 与 pointcloud 模式均支持）
         if auto_mode and (epoch + 1) % eval_interval == 0:
             print(f"\n{'='*60}")
@@ -570,86 +665,15 @@ def pretrain_model(config, gpu_id, wandb_run=None):
         print(f"\n[Auto模式] 达到最大训练轮数 {max_epochs}，停止训练")
 
     # ------------------------------------------------------------------
-    # 9. 保存检查点（使用 EMA 权重）
+    # 9. 保存最后一个非整周期 epoch（使用 EMA 权重）
     # ------------------------------------------------------------------
     print(f"\n训练完成，准备保存模型...")
 
-    ema_unet.copy_to(action_unet.parameters())
-    if ema_decoder is not None:
-        ema_decoder.copy_to(action_decoder.parameters())
-    if ema_obs_encoder is not None:
-        ema_obs_encoder.copy_to(obs_encoder.parameters())
-
-    os.makedirs(config.pretrain.checkpoint_dir, exist_ok=True)
-
-    obs_mode_tag = f"_{obs_mode}"
-    if auto_mode:
-        checkpoint_name = f"pretrain_auto_epoch{final_epoch}_episodes{config.pretrain.num_episodes}{obs_mode_tag}.pth"
-    else:
-        checkpoint_name = f"pretrain_epoch{config.pretrain.num_epochs}_episodes{config.pretrain.num_episodes}{obs_mode_tag}.pth"
-
-    checkpoint_path = os.path.join(config.pretrain.checkpoint_dir, checkpoint_name)
-
-    ckpt = {
-        'epoch':                      final_epoch - 1,
-        'obs_mode':                   obs_mode,
-        'pretrain_loss_type':         pretrain_loss_type,
-        # velocity 模式：UNet 直出速度场，ActionDecoder 未训练，下游 RL/eval
-        # 加载时应据此跳过 decoder（pipeline_with_logprob 已支持 action_decoder=None）
-        'decoder_trained':            decoder_trains_in_pretrain,
-        'model_state_dict':           action_unet.state_dict(),
-        'action_unet_state_dict':     action_unet.state_dict(),   # 向后兼容
-        'action_decoder_state_dict':  action_decoder.state_dict(),
-        'optimizer_state_dict':       optimizer.state_dict(),
-        'lr_scheduler_state_dict':    lr_scheduler.state_dict() if lr_scheduler is not None else None,
-        'ema_unet_state_dict':        ema_unet.state_dict(),
-        'ema_decoder_state_dict':     ema_decoder.state_dict() if ema_decoder is not None else None,
-        'loss':                       avg_loss,
-        'config':                     config.to_dict(),
-        'obs_dim':                    obs_dim,
-        'action_dim':                 action_dim,
-        'auto_mode':                  auto_mode,
-        'training_stopped':           training_stopped if auto_mode else False,
-    }
-
-    # 所有模式都保存归一化器（state 模式同样需要，用于推理时归一化 obs / 反归一化 action）
-    ckpt['normalizer_state_dict'] = normalizer.state_dict()
-
-    # pointcloud / image 模式额外保存 obs_encoder
-    if obs_encoder is not None:
-        ckpt['obs_encoder_state_dict'] = obs_encoder.state_dict()
-        ckpt['ema_obs_encoder_state_dict'] = ema_obs_encoder.state_dict()
-
-        if obs_mode == 'pointcloud':
-            ckpt['pcd_encoder_config'] = {
-                'n_obs_steps':   pcd_n_obs_steps,
-                'pcd_out_dim':   pcd_enc_out_dim,
-                'agent_pos_dim': pcd_agent_pos_dim,
-                'state_mlp_out': pcd_state_mlp_out,
-                'use_layernorm': pcd_use_layernorm,
-                'final_norm':    pcd_final_norm,
-            }
-        elif obs_mode == 'image':
-            ckpt['img_encoder_config'] = {
-                'n_obs_steps':    img_n_obs_steps,
-                'in_channels':    img_in_channels,
-                'resnet_name':    img_resnet_name,
-                'img_feat_dim':   img_resnet_feat_dim,
-                'agent_pos_dim':  img_agent_pos_dim,
-                'state_mlp_out':  img_state_mlp_out,
-                'use_groupnorm':  img_use_groupnorm,
-                'camera':         img_camera,
-                'use_depth':      img_use_depth,
-                'depth_max':      img_depth_max,
-            }
-
-    torch.save(ckpt, checkpoint_path)
-    if wandb_run is not None:
-        wandb_run.summary['checkpoint_path'] = checkpoint_path
-        wandb_run.summary['final_loss'] = avg_loss
+    if final_epoch % checkpoint_interval != 0 or training_stopped:
+        checkpoint_path_saved = save_checkpoint(final_epoch, avg_loss, stopped=training_stopped)
 
     print(f"\n预训练完成！")
-    print(f"检查点已保存: {checkpoint_path}")
+    print(f"最终检查点: {checkpoint_path_saved}")
     if auto_mode:
         print(f"  训练模式: Auto (自动停止)")
         print(f"  实际训练轮数: {final_epoch} epochs")
@@ -671,4 +695,4 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     print(f"  最终损失: {avg_loss:.6f}")
     print(f"{'='*60}\n")
 
-    return checkpoint_path
+    return checkpoint_path_saved

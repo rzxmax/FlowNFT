@@ -63,6 +63,13 @@ python -m train.reinforcement.main \
 点云脚本会把训练指标发送到 W&B 的 `545242836-zju/FlowNFT`。首次运行前，
 使用该账号的 API key 执行 `wandb login`；密钥无需写入脚本或仓库。
 训练期间会记录 batch/epoch 损失、学习率，以及 Auto 模式下的评估结果。
+模仿训练每 50 个 epoch 保存一次 checkpoint，每次运行在配置的
+`pretrain.checkpoint_dir` 下创建独立目录，例如
+`checkpoints/imitation/state/pretrain_epoch500_episodes1000_state_0918/`。
+目录内的文件按实际 epoch 命名；每次保存成功后只保留该次运行最新的 3 个
+`.pth` 文件。若训练在非 50 的整数倍 epoch 结束，也会额外保存最终权重。
+同一天同配置重复运行时，目录名会追加 `_2`、`_3` 等序号。
+评估或强化训练时，使用目录内 `.pth` 文件的完整路径。
 
 数据与模型权重按用途保存在以下位置（从仓库根目录运行命令）：
 

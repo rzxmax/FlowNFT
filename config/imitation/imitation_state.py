@@ -7,5 +7,10 @@ def get_config():
     config = get_base_config()
     config.pretrain.obs_mode = 'state'
     config.env_kwargs.obs_mode = 'state'
-    config.pretrain.dataset_path = 'data/datasets/state/episodes'
+    config.pretrain.dataset_path = (
+        '~/.maniskill/demos/PickCube-v1/motionplanning/'
+        'trajectory.state.pd_ee_delta_pos.physx_cpu.h5'
+    )
+    config.pretrain.checkpoint_dir = 'checkpoints/imitation/state/'
+    config.pretrain.loss_type = 'velocity'
     return config

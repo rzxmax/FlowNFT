@@ -8,11 +8,13 @@ from config.robot_base import get_config as get_robot_config
 def get_config():
     config = get_robot_config()
     pretrain = config.pretrain = ml_collections.ConfigDict()
-    pretrain.num_episodes = 50
-    pretrain.num_epochs = 200
+    pretrain.num_episodes = 1000
+    pretrain.num_epochs = 500
     pretrain.batch_size = 64
     pretrain.learning_rate = 1e-4
     pretrain.checkpoint_dir = 'checkpoints/imitation'
+    pretrain.checkpoint_interval = 50
+    pretrain.checkpoint_keep = 3
     pretrain.gradient_accumulation_steps = 1
     pretrain.max_grad_norm = 1.0
     pretrain.loss_type = 'action'
