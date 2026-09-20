@@ -24,7 +24,7 @@ from train.reinforcement.advantage import compute_episode_level_advantages
 from train.reinforcement.evaluation import eval_in_env
 from train.reinforcement.evaluation import evaluate_model_inline
 from train.reinforcement.sampler import sample_complete_trajectories
-from train.common.checkpoint import save_ckpt
+from train.common.checkpoint import reinforcement_run_dir, save_ckpt
 from train.reinforcement.losses.diffusionnft import train_on_episode_samples_diffusionnft
 from train.reinforcement.losses.stepnft import train_on_episode_samples_stepnft
 from train.common.checkpoint import unwrap_model
@@ -63,6 +63,16 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
 
     requested_checkpoint = pretrain_checkpoint
     pretrain_checkpoint = resolve_pretrain_checkpoint(config, requested_checkpoint)
+
+    # 每次 RL 训练使用独立目录：<预训练权重名>_<NFT算法名>_<月日>。
+    # 例如：pretrain_epoch100_episodes500_state_StepNFT_0920
+    if pretrain_checkpoint is not None:
+        config.save_dir = reinforcement_run_dir(
+            config.save_dir,
+            pretrain_checkpoint,
+            config.train.loss_type,
+        )
+        logger.info(f"强化学习 checkpoint 保存目录: {config.save_dir}")
 
     # 计算训练时间步数
     num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)

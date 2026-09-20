@@ -8,7 +8,7 @@
   --num_episodes 50 --gpu 0
 
 ./venv_fm/bin/python test/evaluate_checkpoint.py \
-  --checkpoint checkpoints/reinforcement/FlowNFT/checkpoints/checkpoint-epoch10 \
+  --checkpoint checkpoints/reinforcement/FlowNFT/<pretrain名称>_<NFT名称>_<月日>/checkpoint-epoch10 \
   --num_episodes 50 --gpu 0
 ```
 

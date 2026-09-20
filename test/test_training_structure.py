@@ -1,5 +1,7 @@
 """CPU smoke tests for the refactored training boundaries."""
 
+from datetime import datetime
+
 import numpy as np
 import pytest
 import torch
@@ -12,7 +14,7 @@ from config.imitation.imitation_rgbd import get_config as rgbd_config
 from config.imitation.imitation_state import get_config as state_config
 from config.reinforcement.reinforcement_diffusionnft import get_config as diffusionnft_config
 from config.reinforcement.reinforcement_stepnft import get_config as stepnft_config
-from train.common.checkpoint import save_ckpt
+from train.common.checkpoint import reinforcement_run_dir, save_ckpt
 from train.common.observations import sample_pcd
 from train.common.sampling import _unet_timestep_input, denoise_with_sde_snap
 from train.imitation import main as imitation_main
@@ -219,7 +221,7 @@ def test_reinforcement_checkpoint_keeps_imitation_metadata(tmp_path, monkeypatch
         decoder_trained=False, pretrain_loss_type='velocity',
     )
     saved = torch.load(
-        tmp_path / 'checkpoints' / 'checkpoint-epoch1' / 'model.pth',
+        tmp_path / 'checkpoint-epoch1' / 'model.pth',
         map_location='cpu', weights_only=False,
     )
     assert saved['action_dim'] == 4
@@ -227,6 +229,19 @@ def test_reinforcement_checkpoint_keeps_imitation_metadata(tmp_path, monkeypatch
     assert saved['pretrain_loss_type'] == 'velocity'
     assert saved['loss_type'] == 'rollout'
     assert 'action_decoder_state_dict' not in saved
+
+
+def test_reinforcement_run_dir_uses_pretrain_loss_and_date(tmp_path):
+    run_dir = reinforcement_run_dir(
+        tmp_path,
+        '/models/pretrain_epoch100_episodes500_state.pth',
+        'stepnft',
+        now=datetime(2026, 9, 20),
+    )
+
+    assert run_dir == str(
+        tmp_path / 'pretrain_epoch100_episodes500_state_StepNFT_0920'
+    )
 
 
 @pytest.mark.parametrize(

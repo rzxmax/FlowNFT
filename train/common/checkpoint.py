@@ -1,10 +1,23 @@
 """Extracted training components; function bodies preserve the legacy implementation."""
 
 from train.common.runtime import (
+    datetime,
     logger,
     os,
     torch,
 )
+
+
+def reinforcement_run_dir(base_dir, pretrain_checkpoint, loss_type, now=None):
+    """Build the directory name for one reinforcement-training run."""
+    pretrain_name = os.path.splitext(os.path.basename(os.fspath(pretrain_checkpoint)))[0]
+    nft_name = {
+        "stepnft": "StepNFT",
+        "rollout": "DiffusionNFT",
+    }.get(str(loss_type).lower(), str(loss_type))
+    date_suffix = (now or datetime.datetime.now()).strftime("%m%d")
+    return os.path.join(base_dir, f"{pretrain_name}_{nft_name}_{date_suffix}")
+
 
 def unwrap_model(model, accelerator):
     from diffusers.utils.torch_utils import is_compiled_module
@@ -25,7 +38,7 @@ def save_ckpt(save_dir, action_unet, action_decoder, epoch, accelerator, ema, tr
       - normalizer_state_dict:  pipeline.linear_normalizer 的 state_dict
       - pretrain_loss_type:     'velocity' 或 'action'，标记预训练阶段的 loss 路径
     """
-    save_root = os.path.join(save_dir, "checkpoints", f"checkpoint-epoch{epoch}")
+    save_root = os.path.join(save_dir, f"checkpoint-epoch{epoch}")
     os.makedirs(save_root, exist_ok=True)
 
     if accelerator.is_main_process:
