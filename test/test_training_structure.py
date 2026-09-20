@@ -18,6 +18,7 @@ from train.common.checkpoint import reinforcement_run_dir, save_ckpt
 from train.common.observations import sample_pcd
 from train.common.sampling import _unet_timestep_input, denoise_with_sde_snap
 from train.imitation import main as imitation_main
+from train.imitation.evaluator import _actions_to_env_space
 from train.reinforcement.advantage import compute_episode_level_advantages
 from train.reinforcement.old_policy import return_decay
 from train.reinforcement.losses import diffusionnft, stepnft
@@ -166,6 +167,27 @@ def test_flow_schedule_and_old_policy_decay():
     assert return_decay(74, 2) == 0.0
     with pytest.raises(ValueError, match='Unknown decay_type'):
         return_decay(0, 3)
+
+
+def test_imitation_actions_are_converted_to_environment_space():
+    class OffsetActionNormalizer:
+        @staticmethod
+        def unnormalize(actions):
+            return actions * 2.0 + 3.0
+
+    actions_normalized = torch.tensor([
+        [-1.0, 0.0],
+        [0.5, 1.0],
+    ])
+    normalizer = {'action': OffsetActionNormalizer()}
+
+    actions = _actions_to_env_space(actions_normalized, normalizer)
+
+    torch.testing.assert_close(
+        actions,
+        torch.tensor([[1.0, 3.0], [4.0, 5.0]]),
+    )
+    assert _actions_to_env_space(actions_normalized, None) is actions_normalized
 
 
 def test_stepnft_sampler_shapes_on_cpu():

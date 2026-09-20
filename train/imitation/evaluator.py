@@ -12,6 +12,16 @@ from train.common.observations import extract_pointcloud_obs
 from train.common.observations import stack_image_obs
 from train.common.observations import stack_pointcloud_obs
 
+
+def _actions_to_env_space(actions_normalized, normalizer):
+    """Convert a predicted action horizon from normalized to environment space."""
+    if normalizer is None:
+        return actions_normalized
+    return normalizer['action'].unnormalize(
+        actions_normalized.unsqueeze(0)
+    ).squeeze(0)
+
+
 def evaluate_pretrain_model(action_unet, action_decoder, pipeline, config, device,
                             num_episodes=10, obs_encoder=None,
                             normalizer=None, obs_mode=None):
@@ -152,13 +162,10 @@ def evaluate_pretrain_model(action_unet, action_decoder, pipeline, config, devic
                 )
                 actions_norm = result["actions"][0]  # (H, action_dim)，归一化空间
 
-            # state 模式：模型输出的是归一化空间的 action，需要反归一化到真实空间
-            if obs_mode == 'state' and normalizer is not None:
-                actions = normalizer['action'].unnormalize(
-                    actions_norm.unsqueeze(0)
-                ).squeeze(0)
-            else:
-                actions = actions_norm
+            # 所有观测模式都用归一化动作作为训练目标，因此送入环境前必须统一
+            # 恢复到真实动作空间。此前这里只处理 state，导致 image/pointcloud
+            # 将 [-1, 1] 空间的预测直接传给 ManiSkill。
+            actions = _actions_to_env_space(actions_norm, normalizer)
 
             for j in range(config.action_horizon):
                 if done or episode_length >= max_steps:

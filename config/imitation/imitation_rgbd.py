@@ -8,8 +8,9 @@ def get_config():
     config.pretrain.obs_mode = 'image'
     config.env_kwargs.obs_mode = 'rgbd'
     config.pretrain.dataset_path = 'config/imitation/datasets_rgbd.json'
+    config.pretrain.loss_type = 'velocity'
     pretrain = config.pretrain
-    pretrain.img_n_obs_steps = 2
+    pretrain.img_n_obs_steps = 1
     pretrain.img_camera = 'base_camera'
     pretrain.img_use_depth = True
     pretrain.img_depth_max = 5.0
