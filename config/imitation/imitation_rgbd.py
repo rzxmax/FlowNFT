@@ -20,4 +20,5 @@ def get_config():
     pretrain.img_state_mlp_out = 64
     pretrain.img_use_groupnorm = True
     pretrain.img_size = (128, 128)
+    pretrain.num_epochs = 1000
     return config

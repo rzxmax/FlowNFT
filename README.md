@@ -45,11 +45,11 @@ source venv_fm/bin/activate
 python -m pip install \
   pip==23.0.1 setuptools==58.1.0 wheel==0.45.1
 
-# 先安装根项目的固定版本依赖
-python -m pip install -r requirements.txt
-
-# 再安装仓库锁定的本地 flow_grpo；不要 pip install GitHub 的 HEAD
+# 先安装仓库锁定的本地 flow_grpo；不要 pip install GitHub 的 HEAD
 python -m pip install -e ./flow_grpo
+
+# 最后安装根项目的固定版本依赖，根项目的版本约束为准
+python -m pip install -r requirements.txt
 ```
 
 不要使用 `sudo pip`。以后进入项目时执行
@@ -73,6 +73,7 @@ import diffusers
 import transformers
 import accelerate
 import mani_skill
+import wandb
 from train.common.bootstrap import configure_import_paths
 
 configure_import_paths()
@@ -88,6 +89,7 @@ assert diffusers.__version__ == "0.33.1", diffusers.__version__
 assert transformers.__version__ == "4.40.0", transformers.__version__
 assert accelerate.__version__ == "1.4.0", accelerate.__version__
 assert mani_skill.__version__ == "3.0.0b21", mani_skill.__version__
+assert wandb.__version__ == "0.22.3", wandb.__version__
 assert Path(ema.__file__).resolve().is_relative_to(project / "flow_grpo"), ema.__file__
 
 print("python:", sys.version.split()[0])
