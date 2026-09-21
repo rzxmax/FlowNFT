@@ -11,7 +11,7 @@ def get_config():
     config.env_kwargs.obs_mode = 'state'
     config.run_name = ''
     config.logdir = 'logs'
-    config.save_freq = 5
+    config.save_freq = 10
     config.num_checkpoint_limit = 5
     config.mixed_precision = 'fp16'
     config.allow_tf32 = True

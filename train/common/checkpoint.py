@@ -27,7 +27,8 @@ def unwrap_model(model, accelerator):
 
 
 def save_ckpt(save_dir, action_unet, action_decoder, epoch, accelerator, ema, trainable_parameters, config,
-              linear_normalizer=None, decoder_trained=None, pretrain_loss_type=None):
+              linear_normalizer=None, decoder_trained=None, pretrain_loss_type=None,
+              obs_encoder=None, obs_mode='state', obs_encoder_config=None):
     """保存检查点
 
     除模型权重外，额外写入架构元数据 (obs_dim / action_dim / action_horizon / 关键超参)
@@ -96,6 +97,7 @@ def save_ckpt(save_dir, action_unet, action_decoder, epoch, accelerator, ema, tr
             # ── 与预训练 checkpoint 对齐的关键字段 ──
             'decoder_trained': bool(decoder_trained),
             'pretrain_loss_type': pretrain_loss_type,  # 可能为 None（旧 checkpoint）
+            'obs_mode': obs_mode,
         }
 
         if decoder_unwrapped is not None:
@@ -104,6 +106,13 @@ def save_ckpt(save_dir, action_unet, action_decoder, epoch, accelerator, ema, tr
         # 写入 LinearNormalizer state_dict（供 test/evaluate_checkpoint.py 复用）
         if linear_normalizer is not None:
             ckpt['normalizer_state_dict'] = linear_normalizer.state_dict()
+
+        if obs_encoder is not None:
+            ckpt['obs_encoder_state_dict'] = unwrap_model(
+                obs_encoder, accelerator
+            ).state_dict()
+            if obs_mode == 'image' and obs_encoder_config is not None:
+                ckpt['img_encoder_config'] = dict(obs_encoder_config)
 
         torch.save(ckpt, os.path.join(save_root, "model.pth"))
 

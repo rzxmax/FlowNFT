@@ -14,6 +14,7 @@ from config.imitation.imitation_rgbd import get_config as rgbd_config
 from config.imitation.imitation_state import get_config as state_config
 from config.reinforcement.reinforcement_diffusionnft import get_config as diffusionnft_config
 from config.reinforcement.reinforcement_stepnft import get_config as stepnft_config
+from config.reinforcement.reinforcement_stepnft_image import get_config as stepnft_image_config
 from train.common.checkpoint import reinforcement_run_dir, save_ckpt
 from train.common.observations import sample_pcd
 from train.common.sampling import _unet_timestep_input, denoise_with_sde_snap
@@ -22,6 +23,7 @@ from train.imitation.evaluator import _actions_to_env_space
 from train.reinforcement.advantage import compute_episode_level_advantages
 from train.reinforcement.old_policy import return_decay
 from train.reinforcement.losses import diffusionnft, stepnft
+from train.reinforcement.observation import ImageObservationAdapter
 
 
 def test_stage_configs_are_independent():
@@ -31,11 +33,15 @@ def test_stage_configs_are_independent():
     rgbd = rgbd_config()
     diffusionnft = diffusionnft_config()
     stepnft = stepnft_config()
+    stepnft_image = stepnft_image_config()
 
     assert (state.pretrain.obs_mode, pointcloud.pretrain.obs_mode,
             rgbd.pretrain.obs_mode) == ('state', 'pointcloud', 'image')
     assert diffusionnft.train.loss_type == 'rollout'
     assert stepnft.train.loss_type == 'stepnft'
+    assert stepnft_image.train.loss_type == 'stepnft'
+    assert stepnft_image.policy_obs_mode == 'image'
+    assert stepnft_image.env_kwargs.obs_mode == 'rgbd'
     assert 'pretrain' not in shared and 'train' not in shared
     assert 'obs_mode' not in shared.env_kwargs and 'max_episode_steps' not in shared
     assert 'train' not in state and 'pretrain' not in diffusionnft
@@ -216,6 +222,44 @@ def test_stepnft_sampler_shapes_on_cpu():
     assert torch.isfinite(actions).all()
 
 
+def test_image_reinforcement_observation_adapter_on_cpu():
+    class CaptureEncoder(torch.nn.Module):
+        def forward(self, image, agent_pos):
+            self.image = image
+            self.agent_pos = agent_pos
+            return torch.cat((image.mean(dim=(2, 3, 4)), agent_pos.mean(dim=2)), dim=1)
+
+    encoder = CaptureEncoder()
+    adapter = ImageObservationAdapter(
+        encoder=encoder,
+        device=torch.device('cpu'),
+        encoder_config={
+            'camera': 'base_camera', 'use_depth': True, 'depth_max': 2.0,
+            'n_obs_steps': 1,
+        },
+        image_size=(2, 3),
+    )
+    observation = {
+        'sensor_data': {'base_camera': {
+            'rgb': torch.full((2, 4, 6, 3), 255, dtype=torch.uint8),
+            'depth': torch.full((2, 4, 6, 1), 1000, dtype=torch.int16),
+        }},
+        'agent': {'qpos': torch.zeros(2, 9)},
+        'extra': {
+            'goal_pos': torch.ones(2, 3),
+            'tcp_pose': torch.ones(2, 7) * 2,
+        },
+    }
+
+    encoded = adapter.encode(observation)
+
+    assert encoded.shape == (2, 2)
+    assert encoder.image.shape == (2, 1, 4, 2, 3)
+    assert encoder.agent_pos.shape == (2, 1, 19)
+    torch.testing.assert_close(encoder.image[:, :, :3], torch.ones(2, 1, 3, 2, 3))
+    torch.testing.assert_close(encoder.image[:, :, 3:], torch.full((2, 1, 1, 2, 3), 0.5))
+
+
 def test_reinforcement_checkpoint_keeps_imitation_metadata(tmp_path, monkeypatch):
     import logging
     from train.common import checkpoint
@@ -251,6 +295,41 @@ def test_reinforcement_checkpoint_keeps_imitation_metadata(tmp_path, monkeypatch
     assert saved['pretrain_loss_type'] == 'velocity'
     assert saved['loss_type'] == 'rollout'
     assert 'action_decoder_state_dict' not in saved
+
+
+def test_reinforcement_checkpoint_keeps_image_encoder(tmp_path, monkeypatch):
+    import logging
+    from train.common import checkpoint
+
+    monkeypatch.setattr(checkpoint, 'logger', logging.getLogger(__name__))
+
+    class DummyAccelerator:
+        is_main_process = True
+
+        @staticmethod
+        def unwrap_model(model):
+            return model
+
+    class TinyPolicy(torch.nn.Linear):
+        input_dim = 4
+
+    config = stepnft_image_config()
+    config.train.ema = False
+    policy = TinyPolicy(4, 4)
+    encoder = torch.nn.Linear(3, 2)
+    image_config = {'n_obs_steps': 1, 'in_channels': 4}
+    save_ckpt(
+        str(tmp_path), policy, None, 1, DummyAccelerator(), None,
+        list(policy.parameters()), config, obs_encoder=encoder,
+        obs_mode='image', obs_encoder_config=image_config,
+    )
+    saved = torch.load(
+        tmp_path / 'checkpoint-epoch1' / 'model.pth',
+        map_location='cpu', weights_only=False,
+    )
+    assert saved['obs_mode'] == 'image'
+    assert saved['img_encoder_config'] == image_config
+    assert saved['obs_encoder_state_dict'].keys() == encoder.state_dict().keys()
 
 
 def test_reinforcement_run_dir_uses_pretrain_loss_and_date(tmp_path):

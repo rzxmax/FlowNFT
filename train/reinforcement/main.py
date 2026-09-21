@@ -17,7 +17,15 @@ def main(_):
         loss = FLAGS.config.train.loss_type
         if loss not in ('rollout', 'stepnft'):
             raise ValueError(f'Unsupported reinforcement loss: {loss!r}')
-        print(f'Reinforcement configuration OK: loss_type={loss}')
+        policy_obs_mode = getattr(FLAGS.config, 'policy_obs_mode', 'state')
+        if policy_obs_mode not in ('state', 'image'):
+            raise ValueError(f'Unsupported policy_obs_mode: {policy_obs_mode!r}')
+        if policy_obs_mode == 'image' and FLAGS.config.env_kwargs.obs_mode != 'rgbd':
+            raise ValueError("Image policy requires env_kwargs.obs_mode='rgbd'")
+        print(
+            f'Reinforcement configuration OK: loss_type={loss}, '
+            f'policy_obs_mode={policy_obs_mode}'
+        )
         return
     return run_reinforcement(
         FLAGS.config, FLAGS.gpu, pretrain_checkpoint=FLAGS.pretrain_checkpoint

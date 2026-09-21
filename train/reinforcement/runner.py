@@ -64,6 +64,26 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     requested_checkpoint = pretrain_checkpoint
     pretrain_checkpoint = resolve_pretrain_checkpoint(config, requested_checkpoint)
 
+    # Read modality and model metadata before creating the environment/models.
+    # Image policies cannot infer their condition dimension from the raw RGB-D
+    # observation dictionary, so the imitation checkpoint is the source of truth.
+    pretrain_meta = {}
+    if pretrain_checkpoint:
+        pretrain_meta = torch.load(pretrain_checkpoint, map_location='cpu', weights_only=False)
+    configured_obs_mode = getattr(config, 'policy_obs_mode', 'state')
+    policy_obs_mode = pretrain_meta.get('obs_mode', configured_obs_mode)
+    if policy_obs_mode != configured_obs_mode:
+        raise ValueError(
+            f"配置要求 policy_obs_mode={configured_obs_mode!r}，但 checkpoint 是 "
+            f"obs_mode={policy_obs_mode!r}；请使用匹配的强化学习配置。"
+        )
+    if policy_obs_mode not in ('state', 'image'):
+        raise ValueError(
+            f"NFT 强化学习暂不支持观测模式 {policy_obs_mode!r}；支持 'state' 和 'image'。"
+        )
+    if policy_obs_mode == 'image' and config.env_kwargs.obs_mode != 'rgbd':
+        raise ValueError("图像策略要求 config.env_kwargs.obs_mode='rgbd'")
+
     # 每次 RL 训练使用独立目录：<预训练权重名>_<NFT算法名>_<月日>。
     # 例如：pretrain_epoch100_episodes500_state_StepNFT_0920
     if pretrain_checkpoint is not None:
@@ -72,7 +92,6 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
             pretrain_checkpoint,
             config.train.loss_type,
         )
-        logger.info(f"强化学习 checkpoint 保存目录: {config.save_dir}")
 
     # 计算训练时间步数
     num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
@@ -92,6 +111,8 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
         project_config=accelerator_config,
         gradient_accumulation_steps=1,  # 设为1，梯度累积在train_on_samples中手动处理
     )
+    if pretrain_checkpoint is not None:
+        logger.info(f"强化学习 checkpoint 保存目录: {config.save_dir}")
     if requested_checkpoint and pretrain_checkpoint != Path(requested_checkpoint).expanduser().resolve():
         logger.info(f"预训练 checkpoint 已从旧路径解析到: {pretrain_checkpoint}")
     elif pretrain_checkpoint:
@@ -156,8 +177,10 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
             logger.info(f"  GPU 使用情况:\n{result.stdout if result.stdout else '无法获取'}")
         except:
             pass
+    elif isinstance(test_obs, dict):
+        logger.info(f"  ✓ 环境返回结构化观测（policy_obs_mode={policy_obs_mode}）")
     else:
-        logger.warning(f"  ⚠ 环境观测数据不是torch.Tensor，GPU加速可能未启用")
+        logger.warning(f"  ⚠ 未识别的环境观测类型: {type(test_obs).__name__}")
     logger.info(f"{'='*60}\n")
     env.reset(seed=config.seed)  # 重新reset一次
 
@@ -173,12 +196,8 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     # 评估环境可以启用auto_reset（每个episode独立评估，无需组内比较）
     eval_env = gym.make(config.env_id, reconfiguration_freq=1, **eval_env_kwargs)
 
-    # 从环境获取维度信息
+    # 从环境获取动作维度；图像策略的 obs_dim 由视觉编码器决定。
     obs, _ = env.reset(seed=config.seed)
-    if isinstance(obs, torch.Tensor):
-        obs_dim = obs.shape[-1]
-    else:
-        obs_dim = obs.shape[-1] if hasattr(obs, 'shape') else len(obs)
 
     # 对于批量环境，需要获取单个环境的动作维度
     # ManiSkill 批量环境的 action_space.shape 是 (num_envs, action_dim)
@@ -191,20 +210,6 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
         # 单个环境：shape = (action_dim,)
         action_dim = env.action_space.shape[0]
 
-    logger.info(f"环境信息:")
-    logger.info(f"  观测维度: {obs_dim}")
-    logger.info(f"  动作维度: {action_dim}")
-    logger.info(f"  动作序列长度: {config.action_horizon}")
-
-    # ====================================================================
-    # 预扫描预训练 checkpoint 元数据：决定 decoder_active / linear_normalizer
-    # 在 CPU 上读取一次，先用元数据决定模型结构，创建模型后再复制权重。
-    # ====================================================================
-    pretrain_meta = {}
-    if pretrain_checkpoint:
-        # torch.load 会读取完整文件；保留载荷，避免后面重复读取大 checkpoint。
-        pretrain_meta = torch.load(pretrain_checkpoint, map_location='cpu', weights_only=False)
-
     # 预训练侧契约：
     #   decoder_trained=True  → action_loss 路径，decoder 必须参与 RL
     #   decoder_trained=False → velocity_loss 路径，decoder 完全旁路
@@ -213,11 +218,72 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     pretrain_loss_type = pretrain_meta.get('pretrain_loss_type', None)
     has_normalizer = 'normalizer_state_dict' in pretrain_meta
 
+    linear_normalizer = None
+    if has_normalizer:
+        from models.normalizer import LinearNormalizer
+        linear_normalizer = LinearNormalizer()
+        linear_normalizer.load_state_dict(pretrain_meta['normalizer_state_dict'])
+        linear_normalizer.to(accelerator.device).eval()
+
+    obs_encoder = None
+    img_encoder_config = None
+    if policy_obs_mode == 'image':
+        if 'obs_encoder_state_dict' not in pretrain_meta:
+            raise ValueError('图像预训练 checkpoint 缺少 obs_encoder_state_dict')
+        from models.image_encoder import ImageObsEncoder
+
+        fallback = getattr(config, 'observation', {})
+        img_encoder_config = dict(pretrain_meta.get('img_encoder_config', {}))
+        defaults = {
+            'n_obs_steps': 1,
+            'in_channels': 4,
+            'resnet_name': 'resnet18',
+            'img_feat_dim': 512,
+            'agent_pos_dim': 19,
+            'state_mlp_out': 64,
+            'use_groupnorm': True,
+            'camera': 'base_camera',
+            'use_depth': True,
+            'depth_max': 5.0,
+        }
+        for key, default in defaults.items():
+            img_encoder_config.setdefault(key, getattr(fallback, key, default))
+        obs_encoder = ImageObsEncoder(
+            n_obs_steps=int(img_encoder_config['n_obs_steps']),
+            in_channels=int(img_encoder_config['in_channels']),
+            resnet_name=img_encoder_config['resnet_name'],
+            img_feat_dim=int(img_encoder_config['img_feat_dim']),
+            agent_pos_dim=int(img_encoder_config['agent_pos_dim']),
+            state_mlp_hidden=[64, int(img_encoder_config['state_mlp_out'])],
+            use_groupnorm=bool(img_encoder_config['use_groupnorm']),
+        ).to(accelerator.device)
+        obs_encoder.load_state_dict(pretrain_meta['obs_encoder_state_dict'])
+        obs_encoder.requires_grad_(False).eval()
+        obs_dim = obs_encoder.output_dim
+        checkpoint_obs_dim = pretrain_meta.get('obs_dim')
+        if checkpoint_obs_dim is not None and int(checkpoint_obs_dim) != obs_dim:
+            raise ValueError(
+                f"图像编码器输出维度 {obs_dim} 与 checkpoint obs_dim "
+                f"{checkpoint_obs_dim} 不一致"
+            )
+    else:
+        if not isinstance(obs, torch.Tensor):
+            obs = torch.as_tensor(obs)
+        obs_dim = int(obs.shape[-1])
+
+    logger.info(f"环境与策略信息:")
+    logger.info(f"  策略观测模式: {policy_obs_mode}")
+    logger.info(f"  环境观测模式: {config.env_kwargs.obs_mode}")
+    logger.info(f"  策略条件维度: {obs_dim}")
+    logger.info(f"  动作维度: {action_dim}")
+    logger.info(f"  动作序列长度: {config.action_horizon}")
+
     logger.info(f"预训练 checkpoint 元数据扫描:")
     logger.info(f"  路径: {pretrain_checkpoint if pretrain_checkpoint else '<未指定>'}")
     logger.info(f"  decoder_trained: {decoder_active}")
     logger.info(f"  pretrain_loss_type: {pretrain_loss_type!r}")
     logger.info(f"  含 normalizer_state_dict: {has_normalizer}")
+    logger.info(f"  含 obs_encoder: {obs_encoder is not None}")
 
     # 创建模型
     logger.info("初始化模型...")
@@ -250,8 +316,31 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     pipeline._action_unet = action_unet
     pipeline.action_decoder = action_decoder  # None 时 pipeline 也旁路 decoder
     # ── 挂载 LinearNormalizer：所有下游函数通过 pipeline.linear_normalizer 取 ──
-    pipeline.linear_normalizer = None  # 后续从 checkpoint 加载后再赋值
+    pipeline.linear_normalizer = linear_normalizer
     pipeline.decoder_active = decoder_active
+
+    from train.reinforcement.observation import (
+        ImageObservationAdapter,
+        StateObservationAdapter,
+    )
+    if policy_obs_mode == 'image':
+        checkpoint_config = pretrain_meta.get('config', {})
+        checkpoint_pretrain = checkpoint_config.get('pretrain', {})
+        image_size = checkpoint_pretrain.get(
+            'img_size', getattr(config.observation, 'image_size', None)
+        )
+        observation_adapter = ImageObservationAdapter(
+            encoder=obs_encoder,
+            device=accelerator.device,
+            encoder_config=img_encoder_config,
+            normalizer=linear_normalizer,
+            image_size=image_size,
+        )
+    else:
+        observation_adapter = StateObservationAdapter(
+            accelerator.device, normalizer=linear_normalizer
+        )
+    pipeline.observation_adapter = observation_adapter
 
     logger.info(f"模型初始化完成:")
     logger.info(f"  UNet参数数量: {sum(p.numel() for p in action_unet.parameters())}")
@@ -373,13 +462,8 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
         else:
             logger.info("  ✓ ActionDecoder 已旁路（velocity_loss 模式，不加载权重）")
 
-        # 3) 加载 LinearNormalizer（pointcloud / image / 已对齐的 state 都会写入）
-        if 'normalizer_state_dict' in checkpoint:
-            from models.normalizer import LinearNormalizer
-            linear_normalizer = LinearNormalizer()
-            linear_normalizer.load_state_dict(checkpoint['normalizer_state_dict'])
-            linear_normalizer.to(accelerator.device).eval()
-            pipeline.linear_normalizer = linear_normalizer
+        # 3) LinearNormalizer 已在构建观测 adapter 前加载。
+        if linear_normalizer is not None:
             logger.info("  ✓ LinearNormalizer 加载成功并挂载到 pipeline.linear_normalizer")
         else:
             logger.info("  ⚠ checkpoint 无 normalizer_state_dict（旧版兼容；RL 阶段将跳过归一化）")
@@ -508,6 +592,7 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
                 accelerator=accelerator,
                 autocast=autocast,
                 seed_offset=config.seed + epoch * 100000 + rollout_idx * 10000,
+                observation_adapter=observation_adapter,
                 epoch=epoch  # 传入epoch用于噪声退火
             )
 
@@ -868,7 +953,10 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
                       accelerator, ema, trainable_parameters, config,
                       linear_normalizer=getattr(pipeline, 'linear_normalizer', None),
                       decoder_trained=decoder_active,
-                      pretrain_loss_type=pretrain_loss_type)
+                      pretrain_loss_type=pretrain_loss_type,
+                      obs_encoder=obs_encoder,
+                      obs_mode=policy_obs_mode,
+                      obs_encoder_config=img_encoder_config)
 
         # 5b. 定期内联评估（仅 main process，每 eval.interval 个 epoch 执行一次）
         eval_cfg = getattr(config, 'eval', None)
@@ -948,7 +1036,11 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     logger.info("训练完成！")
 
     # 最终评估（使用评估环境）
-    eval_in_env(pipeline, action_unet, action_decoder, eval_env, config, accelerator, global_step, num_test_episodes=10)
+    eval_in_env(
+        pipeline, action_unet, action_decoder, eval_env, config, accelerator,
+        global_step, num_test_episodes=10,
+        observation_adapter=observation_adapter,
+    )
 
     # 保存最终模型（使用最终epoch数）
     final_epoch = config.episode.num_epochs
@@ -956,7 +1048,10 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
               accelerator, ema, trainable_parameters, config,
               linear_normalizer=getattr(pipeline, 'linear_normalizer', None),
               decoder_trained=decoder_active,
-              pretrain_loss_type=pretrain_loss_type)
+              pretrain_loss_type=pretrain_loss_type,
+              obs_encoder=obs_encoder,
+              obs_mode=policy_obs_mode,
+              obs_encoder_config=img_encoder_config)
 
     # 关闭环境
     env.close()

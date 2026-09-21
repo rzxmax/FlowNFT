@@ -20,7 +20,8 @@ from train.common.observations import _prepare_obs_tensor
 from train.common.sampling import denoise_ode_inference
 from train.common.checkpoint import unwrap_model
 
-def eval_in_env(pipeline, action_unet, action_decoder, env, config, accelerator, global_step, num_test_episodes=3):
+def eval_in_env(pipeline, action_unet, action_decoder, env, config, accelerator,
+                global_step, num_test_episodes=3, observation_adapter=None):
     """
     在环境中评估策略（与预训练 evaluate_pretrain_model 推理协议对齐）
 
@@ -45,11 +46,16 @@ def eval_in_env(pipeline, action_unet, action_decoder, env, config, accelerator,
     # ── 对齐 sample 阶段：用 pipeline 上挂的 LinearNormalizer 做 obs 归一化 / action 反归一化 ──
     linear_normalizer = getattr(pipeline, 'linear_normalizer', None)
     if linear_normalizer is not None:
-        obs_normalize_fn = lambda x: linear_normalizer['obs'].normalize(x)
         action_unnormalize_fn = lambda a: linear_normalizer['action'].unnormalize(a)
     else:
-        obs_normalize_fn = lambda x: x
         action_unnormalize_fn = lambda a: a
+    if observation_adapter is None:
+        observation_adapter = getattr(pipeline, 'observation_adapter', None)
+    if observation_adapter is None:
+        from train.reinforcement.observation import StateObservationAdapter
+        observation_adapter = StateObservationAdapter(
+            accelerator.device, normalizer=linear_normalizer
+        )
 
     all_episode_rewards = []
     all_episode_lengths = []
@@ -58,15 +64,8 @@ def eval_in_env(pipeline, action_unet, action_decoder, env, config, accelerator,
 
     for test_idx in range(num_test_episodes):
         obs, info = env.reset(seed=10000 + test_idx + accelerator.process_index * 100)
-
-        # 转换观测为tensor → 归一化空间
-        if isinstance(obs, torch.Tensor):
-            obs_tensor = obs.to(accelerator.device, dtype=torch.float32)
-            if obs_tensor.dim() == 1:
-                obs_tensor = obs_tensor.unsqueeze(0)
-        else:
-            obs_tensor = torch.tensor(obs, device=accelerator.device, dtype=torch.float32).unsqueeze(0)
-        obs_tensor = obs_normalize_fn(obs_tensor)
+        observation_adapter.reset()
+        obs_tensor = observation_adapter.encode(obs)
 
         episode_reward = 0
         episode_length = 0
@@ -102,16 +101,11 @@ def eval_in_env(pipeline, action_unet, action_decoder, env, config, accelerator,
                 episode_reward += reward.item() if isinstance(reward, torch.Tensor) else float(reward)
                 episode_length += 1
                 done = terminated
+                if not done and episode_length < max_steps:
+                    observation_adapter.observe(obs)
 
-            # 更新观测（用于下一次生成）→ 同样归一化
             if not done and episode_length < max_steps:
-                if isinstance(obs, torch.Tensor):
-                    obs_tensor = obs.to(accelerator.device, dtype=torch.float32)
-                    if obs_tensor.dim() == 1:
-                        obs_tensor = obs_tensor.unsqueeze(0)
-                else:
-                    obs_tensor = torch.tensor(obs, device=accelerator.device, dtype=torch.float32).unsqueeze(0)
-                obs_tensor = obs_normalize_fn(obs_tensor)
+                obs_tensor = observation_adapter.condition()
 
         all_episode_rewards.append(episode_reward)
         all_episode_lengths.append(episode_length)
@@ -657,11 +651,13 @@ def evaluate_model_inline(
     # ── 对齐 sample 阶段：用 pipeline 上挂的 LinearNormalizer 做 obs / action 处理 ──
     linear_normalizer = getattr(pipeline, 'linear_normalizer', None)
     if linear_normalizer is not None:
-        obs_normalize_fn = lambda x: linear_normalizer['obs'].normalize(x)
         action_unnormalize_fn = lambda a: linear_normalizer['action'].unnormalize(a)
     else:
-        obs_normalize_fn = lambda x: x
         action_unnormalize_fn = lambda a: a
+    observation_adapter = getattr(pipeline, 'observation_adapter', None)
+    if observation_adapter is None:
+        from train.reinforcement.observation import StateObservationAdapter
+        observation_adapter = StateObservationAdapter(device, normalizer=linear_normalizer)
 
     try:
         # ── 生成固定验证集 episode_ids ──
@@ -693,20 +689,12 @@ def evaluate_model_inline(
 
         for ep_idx, episode_id in enumerate(episode_ids):
             obs, _ = eval_env.reset(seed=episode_id, options={'episode_id': episode_id})
-
-            if isinstance(obs, torch.Tensor):
-                obs_tensor = obs.to(device, dtype=torch.float32)
-                if obs_tensor.dim() == 1:
-                    obs_tensor = obs_tensor.unsqueeze(0)
-            else:
-                obs_tensor = torch.tensor(obs, device=device, dtype=torch.float32).unsqueeze(0)
+            observation_adapter.reset()
+            obs_tensor = observation_adapter.encode(obs)
 
             episode_reward = 0.0
             episode_length = 0
             done = False
-
-            # 初始 obs 也要归一化
-            obs_tensor = obs_normalize_fn(obs_tensor)
 
             while not done and episode_length < max_steps:
                 eval_rng = torch.Generator(device=device)
@@ -738,15 +726,11 @@ def evaluate_model_inline(
                     episode_reward += float(reward.item() if isinstance(reward, torch.Tensor) else reward)
                     episode_length += 1
                     done = bool(terminated)
+                    if not done and episode_length < max_steps:
+                        observation_adapter.observe(obs)
 
                 if not done and episode_length < max_steps:
-                    if isinstance(obs, torch.Tensor):
-                        obs_tensor = obs.to(device, dtype=torch.float32)
-                        if obs_tensor.dim() == 1:
-                            obs_tensor = obs_tensor.unsqueeze(0)
-                    else:
-                        obs_tensor = torch.tensor(obs, device=device, dtype=torch.float32).unsqueeze(0)
-                    obs_tensor = obs_normalize_fn(obs_tensor)
+                    obs_tensor = observation_adapter.condition()
 
             all_rewards.append(episode_reward)
             all_success.append(1 if done else 0)

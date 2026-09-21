@@ -5,13 +5,13 @@ from train.common.runtime import (
     torch,
 )
 
-from train.common.observations import _prepare_obs_tensor
 from train.common.sampling import denoise_with_sde_snap
 
 def sample_complete_trajectories(
     env, pipeline, action_unet, action_decoder,
     num_state_groups, samples_per_group,
     config, accelerator, autocast, seed_offset,
+    observation_adapter=None,
     epoch=0  # 新增：用于噪声退火
 ):
     """
@@ -42,18 +42,20 @@ def sample_complete_trajectories(
     if action_decoder is not None:
         action_decoder.eval()
 
-    # ── 对齐预训练：obs 进网络前归一化，action 出网络后保留归一化空间 ──
-    # 1. obs_normalize_fn：obs_tensor → 归一化空间（送入 UNet / pipeline）
-    # 2. action_unnormalize_fn：归一化空间 action → 真实动作空间（送入 env.step）
+    # ── 对齐预训练：adapter 负责观测预处理，normalizer 负责动作反归一化 ──
     # 当 pipeline.linear_normalizer 为 None（无 normalizer 的旧 checkpoint）时，
     # 两个 fn 均为 identity，保持向后兼容
     linear_normalizer = getattr(pipeline, 'linear_normalizer', None)
     if linear_normalizer is not None:
-        obs_normalize_fn = lambda x: linear_normalizer['obs'].normalize(x)
         action_unnormalize_fn = lambda a: linear_normalizer['action'].unnormalize(a)
     else:
-        obs_normalize_fn = lambda x: x
         action_unnormalize_fn = lambda a: a
+
+    if observation_adapter is None:
+        from train.reinforcement.observation import StateObservationAdapter
+        observation_adapter = StateObservationAdapter(
+            accelerator.device, normalizer=linear_normalizer
+        )
 
     num_envs = num_state_groups * samples_per_group
 
@@ -85,6 +87,8 @@ def sample_complete_trajectories(
 
     # 使用seed和episode_id重置环境（确保同组轨迹有完全相同的初始状态）
     obs, info = env.reset(seed=all_seeds, options={'episode_id': all_episode_ids_list})
+    observation_adapter.reset()
+    obs_tensor = observation_adapter.encode(obs)
 
     # 跟踪每个环境的轨迹数据
     env_obs_list = [[] for _ in range(num_envs)]
@@ -117,10 +121,6 @@ def sample_complete_trajectories(
         active_mask = ~env_done
 
         if active_mask.any():
-            obs_tensor_raw = _prepare_obs_tensor(obs, accelerator.device)
-            # ✅ 对齐预训练：obs 进 UNet 前先 LinearNormalizer 归一化
-            obs_tensor = obs_normalize_fn(obs_tensor_raw)
-
             # Flow生成动作（ODE确定性采样）
             with autocast():
                 with torch.no_grad():
@@ -212,8 +212,7 @@ def sample_complete_trajectories(
                 action_step = actions_batch[:, j].contiguous()
 
                 # ✅ 滑动窗口：在执行前保存当前obs（归一化空间）和归一化空间 action
-                obs_tensor_before_raw = _prepare_obs_tensor(obs, accelerator.device)
-                obs_tensor_before = obs_normalize_fn(obs_tensor_before_raw)
+                obs_tensor_before = obs_tensor
                 for env_idx in range(num_envs):
                     if step_active_mask[env_idx]:
                         env_obs_history[env_idx].append(obs_tensor_before[env_idx:env_idx+1].clone())
@@ -222,6 +221,12 @@ def sample_complete_trajectories(
                 # 送入环境前反归一化到真实动作空间
                 action_step_env = action_unnormalize_fn(action_step)
                 obs, reward, terminated, truncated, info = env.step(action_step_env)
+                # StepNFT 只在每个 action chunk 开头使用条件；先低成本更新
+                # 原始历史，chunk 结束后再运行一次视觉编码器。
+                if use_stepnft:
+                    observation_adapter.observe(obs)
+                else:
+                    obs_tensor = observation_adapter.encode(obs)
 
                 # 转换为tensor
                 if not isinstance(reward, torch.Tensor):
@@ -250,6 +255,9 @@ def sample_complete_trajectories(
                 # 防止auto_reset导致的状态重置（虽然我们已禁用auto_reset）
                 env_done = env_done | terminated  # 累积而非覆盖
                 env_steps[step_active_mask] += 1
+
+            if use_stepnft:
+                obs_tensor = observation_adapter.condition()
 
         flow_call_count += 1
 

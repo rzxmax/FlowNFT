@@ -34,7 +34,10 @@ def resolve_pretrain_checkpoint(config, requested=None):
     if not checkpoint_dir.is_dir():
         raise FileNotFoundError(f"预训练 checkpoint 目录不存在: {checkpoint_dir}")
 
-    obs_mode = config.env_kwargs.obs_mode
+    env_obs_mode = config.env_kwargs.obs_mode
+    # ManiSkill exposes image observations as ``rgbd`` while imitation
+    # checkpoints use the policy modality name ``image`` in filenames.
+    obs_mode = 'image' if env_obs_mode == 'rgbd' else env_obs_mode
     checkpoints = [
         path for path in checkpoint_dir.glob('*.pth')
         if 'failed' not in path.stem
