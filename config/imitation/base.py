@@ -24,7 +24,7 @@ def get_config():
     pretrain.distributed_backend = 'nccl'
     pretrain.learning_rate = 1e-4
     pretrain.checkpoint_dir = 'checkpoints/imitation'
-    pretrain.checkpoint_interval = 50
+    pretrain.checkpoint_interval = 200
     pretrain.checkpoint_keep = 3
     pretrain.gradient_accumulation_steps = 1
     pretrain.max_grad_norm = 1.0
