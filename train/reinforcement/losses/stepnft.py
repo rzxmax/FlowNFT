@@ -19,7 +19,8 @@ def train_on_episode_samples_stepnft(
     action_unet_old, action_decoder_old,
     action_unet_ref, action_decoder_ref,
     optimizer, accelerator, config, ema, trainable_parameters,
-    global_step, epoch
+    global_step, epoch, obs_encoder=None, obs_encoder_old=None,
+    obs_encoder_ref=None,
 ):
     """
     StepNFT 风格训练函数：单步 forward + DPO/weighted NLL loss
@@ -55,6 +56,14 @@ def train_on_episode_samples_stepnft(
     action_unet_ref.eval()
     if action_decoder_ref is not None:
         action_decoder_ref.eval()
+    train_visual_encoder = obs_encoder is not None
+    if train_visual_encoder:
+        obs_encoder.train()
+        if obs_encoder_old is not None:
+            obs_encoder_old.eval()
+        if obs_encoder_ref is None:
+            raise ValueError('训练图像策略时必须提供 obs_encoder_ref')
+        obs_encoder_ref.eval()
 
     decoder_active = action_decoder is not None
 
@@ -71,6 +80,8 @@ def train_on_episode_samples_stepnft(
 
     # ========== 阶段1：展平所有 flow_call 的 nft_data 为训练批 ==========
     batch_obs = []
+    batch_images = []
+    batch_agent_pos = []
     batch_xt = []
     batch_v_old = []
     batch_xnext = []
@@ -90,11 +101,20 @@ def train_on_episode_samples_stepnft(
 
         trajectory_advantage = sample["advantage"]
         obs_list = sample["obs_list"]
+        raw_obs_list = sample.get("raw_obs_list", [])
         num_flow_calls = len(nft_traces)
+        if train_visual_encoder and len(raw_obs_list) != num_flow_calls:
+            raise ValueError(
+                "图像 StepNFT 样本缺少与 nft_traces 对齐的 raw_obs_list"
+            )
 
         for flow_idx in range(num_flow_calls):
             trace = nft_traces[flow_idx]
-            batch_obs.append(obs_list[flow_idx])
+            if train_visual_encoder:
+                batch_images.append(raw_obs_list[flow_idx]['image'])
+                batch_agent_pos.append(raw_obs_list[flow_idx]['agent_pos'])
+            else:
+                batch_obs.append(obs_list[flow_idx])
             batch_xt.append(trace["nft_xt"])
             batch_v_old.append(trace["nft_v"])
             batch_xnext.append(trace["nft_xnext"])
@@ -102,12 +122,14 @@ def train_on_episode_samples_stepnft(
             batch_std.append(float(trace["nft_std"]))
             batch_advantages.append(trajectory_advantage)
 
-    if len(batch_obs) == 0:
+    if len(batch_xt) == 0:
         logger.warning(f"Epoch {epoch}: 没有有效 StepNFT 样本，跳过训练")
         return global_step, 0.0
 
     # ========== 阶段2：组装 tensors ==========
-    obs_cond = torch.cat(batch_obs, dim=0)  # [N, obs_dim]
+    obs_cond = None
+    if not train_visual_encoder:
+        obs_cond = torch.cat(batch_obs, dim=0)  # [N, obs_dim]
     xt_all = torch.stack(batch_xt, dim=0)   # [N, action_horizon, action_dim]
     v_old_all = torch.stack(batch_v_old, dim=0)
     xnext_all = torch.stack(batch_xnext, dim=0)
@@ -115,12 +137,17 @@ def train_on_episode_samples_stepnft(
     std_all = torch.tensor(batch_std, device=accelerator.device, dtype=torch.float32)
     adv_all = torch.tensor(batch_advantages, device=accelerator.device, dtype=torch.float32)
 
-    total_batch_size = obs_cond.shape[0]
+    total_batch_size = len(batch_xt)
     logger.info(f"Epoch {epoch} [StepNFT]: 训练 {total_batch_size} 个 nft 样本（每个仅单步 forward）")
 
     # ========== 阶段3：打乱数据 ==========
     perm = torch.randperm(total_batch_size, device=accelerator.device)
-    obs_cond = obs_cond[perm]
+    if train_visual_encoder:
+        perm_list = perm.detach().cpu().tolist()
+        batch_images = [batch_images[index] for index in perm_list]
+        batch_agent_pos = [batch_agent_pos[index] for index in perm_list]
+    else:
+        obs_cond = obs_cond[perm]
     xt_all = xt_all[perm]
     v_old_all = v_old_all[perm]
     xnext_all = xnext_all[perm]
@@ -129,7 +156,9 @@ def train_on_episode_samples_stepnft(
     adv_all = adv_all[perm]
 
     # ========== 阶段4：分批训练 ==========
-    num_batches = max(1, total_batch_size // config.train.batch_size)
+    num_batches = max(
+        1, (total_batch_size + config.train.batch_size - 1) // config.train.batch_size
+    )
     effective_grad_accum_steps = config.train.gradient_accumulation_steps
     current_accumulated_steps = 0
     info = defaultdict(list)
@@ -143,7 +172,15 @@ def train_on_episode_samples_stepnft(
         start_idx = batch_idx * config.train.batch_size
         end_idx = min(start_idx + config.train.batch_size, total_batch_size)
 
-        b_obs = obs_cond[start_idx:end_idx]
+        if train_visual_encoder:
+            b_image = torch.stack(batch_images[start_idx:end_idx]).to(
+                accelerator.device, dtype=torch.float32, non_blocking=True
+            )
+            b_agent_pos = torch.stack(batch_agent_pos[start_idx:end_idx]).to(
+                accelerator.device, dtype=torch.float32, non_blocking=True
+            )
+        else:
+            b_obs = obs_cond[start_idx:end_idx]
         b_xt = xt_all[start_idx:end_idx]
         b_v_old = v_old_all[start_idx:end_idx]
         b_xnext = xnext_all[start_idx:end_idx]
@@ -151,9 +188,18 @@ def train_on_episode_samples_stepnft(
         b_std = std_all[start_idx:end_idx]
         b_adv = adv_all[start_idx:end_idx]
 
-        bsz = b_obs.shape[0]
+        bsz = end_idx - start_idx
 
         with accelerator.autocast():
+            if train_visual_encoder:
+                # Re-encode the rollout RGB-D window inside the autograd graph,
+                # so NFT jointly updates the visual representation and UNet.
+                b_obs = obs_encoder(b_image, b_agent_pos)
+                with torch.no_grad():
+                    b_obs_ref = obs_encoder_ref(b_image, b_agent_pos)
+            else:
+                b_obs_ref = b_obs
+
             # ========== 单步 forward：v_theta = current_unet(x_t, t, obs) ==========
             # 数学使用归一化 timestep（t = step_idx / num_steps，与 _flow_mean 一致），
             # 喂给 UNet 时再用 _unet_timestep_input 缩放到 pretrain 的 SinusoidalPosEmb
@@ -173,7 +219,7 @@ def train_on_episode_samples_stepnft(
                 ref_pred_raw = action_unet_ref(
                     sample=b_xt,
                     timestep=t_unet,
-                    global_cond=b_obs,
+                    global_cond=b_obs_ref,
                 )
                 v_ref = action_decoder_ref(ref_pred_raw) if decoder_active else ref_pred_raw
 
@@ -262,7 +308,14 @@ def train_on_episode_samples_stepnft(
             loss = policy_loss + kl_loss
 
         # ========== 反传 + 梯度累积 ==========
-        scaled_loss = loss / effective_grad_accum_steps
+        accumulation_group_start = (
+            batch_idx // effective_grad_accum_steps
+        ) * effective_grad_accum_steps
+        accumulation_group_size = min(
+            effective_grad_accum_steps,
+            num_batches - accumulation_group_start,
+        )
+        scaled_loss = loss / accumulation_group_size
         accelerator.backward(scaled_loss)
         current_accumulated_steps += 1
 
@@ -282,7 +335,11 @@ def train_on_episode_samples_stepnft(
         epoch_total_losses.append(loss.detach().item())
 
         # ========== 梯度累积完成后更新 ==========
-        if current_accumulated_steps % effective_grad_accum_steps == 0:
+        should_step = (
+            current_accumulated_steps % effective_grad_accum_steps == 0
+            or batch_idx == num_batches - 1
+        )
+        if should_step:
             grad_norm_before = torch.nn.utils.clip_grad_norm_(
                 trainable_parameters, float('inf')
             ).item()
@@ -343,6 +400,10 @@ def train_on_episode_samples_stepnft(
                         "optim/param_update_ratio": param_update_ratio,
                         "optim/learning_rate": optimizer.param_groups[0]['lr'],
                     }
+                    if train_visual_encoder and len(optimizer.param_groups) > 1:
+                        log_dict["optim/obs_encoder_learning_rate"] = (
+                            optimizer.param_groups[1]['lr']
+                        )
                     wandb.log(log_dict, step=global_step)
 
             global_step += 1
@@ -381,6 +442,16 @@ def train_on_episode_samples_stepnft(
                             current_ref_distance += (cur_p - ref_p).pow(2).sum().item()
                             old_ref_distance += (old_p - ref_p).pow(2).sum().item()
 
+                    if train_visual_encoder:
+                        for cur_p, old_p, ref_p in zip(
+                            unwrap_model(obs_encoder, accelerator).parameters(),
+                            obs_encoder_old.parameters(),
+                            obs_encoder_ref.parameters(),
+                        ):
+                            current_old_distance += (cur_p - old_p).pow(2).sum().item()
+                            current_ref_distance += (cur_p - ref_p).pow(2).sum().item()
+                            old_ref_distance += (old_p - ref_p).pow(2).sum().item()
+
                     current_old_distance = np.sqrt(current_old_distance)
                     current_ref_distance = np.sqrt(current_ref_distance)
                     old_ref_distance = np.sqrt(old_ref_distance)
@@ -397,6 +468,15 @@ def train_on_episode_samples_stepnft(
                         for src_param, tgt_param in zip(
                             unwrap_model(action_decoder, accelerator).parameters(),
                             action_decoder_old.parameters()
+                        ):
+                            tgt_param.data.copy_(
+                                tgt_param.data * decay + src_param.data * (1.0 - decay)
+                            )
+
+                    if train_visual_encoder:
+                        for src_param, tgt_param in zip(
+                            unwrap_model(obs_encoder, accelerator).parameters(),
+                            obs_encoder_old.parameters(),
                         ):
                             tgt_param.data.copy_(
                                 tgt_param.data * decay + src_param.data * (1.0 - decay)

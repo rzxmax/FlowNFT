@@ -56,6 +56,12 @@ def eval_in_env(pipeline, action_unet, action_decoder, env, config, accelerator,
         observation_adapter = StateObservationAdapter(
             accelerator.device, normalizer=linear_normalizer
         )
+    visual_encoder = getattr(observation_adapter, 'encoder', None)
+    visual_encoder_was_training = (
+        visual_encoder.training if visual_encoder is not None else False
+    )
+    if visual_encoder is not None:
+        visual_encoder.eval()
 
     all_episode_rewards = []
     all_episode_lengths = []
@@ -131,6 +137,8 @@ def eval_in_env(pipeline, action_unet, action_decoder, env, config, accelerator,
     action_unet.train()
     if action_decoder is not None:
         action_decoder.train()
+    if visual_encoder is not None:
+        visual_encoder.train(visual_encoder_was_training)
 
 
 def test_model(config, checkpoint_path, num_test_episodes=10, gpu_id=0):
@@ -658,6 +666,12 @@ def evaluate_model_inline(
     if observation_adapter is None:
         from train.reinforcement.observation import StateObservationAdapter
         observation_adapter = StateObservationAdapter(device, normalizer=linear_normalizer)
+    visual_encoder = getattr(observation_adapter, 'encoder', None)
+    visual_encoder_was_training = (
+        visual_encoder.training if visual_encoder is not None else False
+    )
+    if visual_encoder is not None:
+        visual_encoder.eval()
 
     try:
         # ── 生成固定验证集 episode_ids ──
@@ -763,3 +777,5 @@ def evaluate_model_inline(
         unet_unwrapped.train()
         if decoder_unwrapped is not None:
             decoder_unwrapped.train()
+        if visual_encoder is not None:
+            visual_encoder.train(visual_encoder_was_training)

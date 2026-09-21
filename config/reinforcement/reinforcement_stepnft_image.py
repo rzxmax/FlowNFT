@@ -28,4 +28,15 @@ def get_config():
     observation.use_groupnorm = True
     observation.image_size = (128, 128)
 
+    # End-to-end visual fine-tuning keeps raw RGB-D windows from rollout and
+    # re-encodes them during the StepNFT update.  Use a smaller rollout batch
+    # and minibatch than the state policy to bound host/GPU memory.
+    config.episode.num_state_groups = 256
+    config.episode.samples_per_group = 1
+    config.episode.parallel_envs = 256
+    config.train.batch_size = 8
+    config.train.gradient_accumulation_steps = 4
+    config.train.train_obs_encoder = True
+    config.train.obs_encoder_learning_rate = 1e-6
+
     return config

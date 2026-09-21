@@ -56,6 +56,8 @@ def sample_complete_trajectories(
         observation_adapter = StateObservationAdapter(
             accelerator.device, normalizer=linear_normalizer
         )
+    if getattr(observation_adapter, 'mode', None) == 'image':
+        observation_adapter.encoder.eval()
 
     num_envs = num_state_groups * samples_per_group
 
@@ -92,6 +94,7 @@ def sample_complete_trajectories(
 
     # 跟踪每个环境的轨迹数据
     env_obs_list = [[] for _ in range(num_envs)]
+    env_raw_obs_list = [[] for _ in range(num_envs)]
     env_clean_actions_list = [[] for _ in range(num_envs)]  # ✅ DiffusionNFT: 保存clean actions
     env_step_rewards = [[] for _ in range(num_envs)]  # 改为记录每一步的奖励
     env_step_dones = [[] for _ in range(num_envs)]    # 记录每一步的done状态
@@ -121,6 +124,7 @@ def sample_complete_trajectories(
         active_mask = ~env_done
 
         if active_mask.any():
+            raw_obs_batch = observation_adapter.snapshot()
             # Flow生成动作（ODE确定性采样）
             with autocast():
                 with torch.no_grad():
@@ -188,6 +192,11 @@ def sample_complete_trajectories(
                     clean_actions = actions_batch[i].clone()  # [action_horizon, action_dim]
                     env_clean_actions_list[i].append(clean_actions)
                     env_obs_list[i].append(obs_tensor[i:i+1].clone())
+                    if raw_obs_batch is not None:
+                        env_raw_obs_list[i].append({
+                            'image': raw_obs_batch['image'][i].clone(),
+                            'agent_pos': raw_obs_batch['agent_pos'][i].clone(),
+                        })
 
                     # StepNFT：保存当前 flow_call 的 nft 数据
                     if use_stepnft and nft_traces_batch is not None:
@@ -290,6 +299,9 @@ def sample_complete_trajectories(
 
         all_samples.append({
             "obs_list": env_obs_list[env_idx],
+            # Image policy: encoder-ready raw RGB-D history kept on CPU so the
+            # visual encoder can be recomputed with gradients during NFT update.
+            "raw_obs_list": env_raw_obs_list[env_idx],
             "clean_actions_list": env_clean_actions_list[env_idx],  # ✅ DiffusionNFT
             "timesteps": timesteps,  # scheduler的timesteps（需要保留）
             "reward": cumulative_reward,

@@ -42,6 +42,10 @@ class StateObservationAdapter:
         self.observe(observation)
         return self.condition()
 
+    def snapshot(self):
+        """State samples already store the policy input directly."""
+        return None
+
 
 class ImageObservationAdapter:
     """Convert ManiSkill RGB-D dictionaries into ImageObsEncoder conditions."""
@@ -121,6 +125,29 @@ class ImageObservationAdapter:
         agent_stack = torch.stack(agents, dim=1)
         with torch.no_grad():
             return self.encoder(image_stack, agent_stack)
+
+    def snapshot(self):
+        """Return an encoder-ready RGB-D history on CPU for NFT updates.
+
+        The rollout graph is intentionally discarded.  Images are retained as
+        float16 to keep the replay payload bounded; they are converted back to
+        float32 before the trainable encoder forward pass.
+        """
+        images = list(self._image_history)
+        agents = list(self._agent_history)
+        if not images:
+            raise RuntimeError('No image observation is available; call observe() first')
+        while len(images) < self.n_obs_steps:
+            images.insert(0, images[0])
+            agents.insert(0, agents[0])
+        return {
+            'image': torch.stack(images, dim=1).detach().to(
+                device='cpu', dtype=torch.float16
+            ),
+            'agent_pos': torch.stack(agents, dim=1).detach().to(
+                device='cpu', dtype=torch.float32
+            ),
+        }
 
     def encode(self, observation):
         self.observe(observation)

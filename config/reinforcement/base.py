@@ -10,8 +10,9 @@ def get_config():
     config.max_episode_steps = 300
     config.env_kwargs.obs_mode = 'state'
     config.run_name = ''
+    config.wandb_project = 'FlowNFT-stepNFT'
     config.logdir = 'logs'
-    config.save_freq = 10
+    config.save_freq = 20
     config.num_checkpoint_limit = 5
     config.mixed_precision = 'fp16'
     config.allow_tf32 = True
@@ -24,7 +25,7 @@ def get_config():
     episode.parallel_envs = episode.num_state_groups * episode.samples_per_group
     episode.rollout_epoch = 1
     episode.update_epoch = 1
-    episode.num_epochs = 100
+    episode.num_epochs = 200
     stage = config.stage = ml_collections.ConfigDict()
     stage.advantage_scale = 1.0
     stage.timestep_weight_start = 1.0

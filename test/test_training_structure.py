@@ -1,6 +1,8 @@
 """CPU smoke tests for the refactored training boundaries."""
 
 from datetime import datetime
+import contextlib
+import copy
 
 import numpy as np
 import pytest
@@ -39,9 +41,17 @@ def test_stage_configs_are_independent():
             rgbd.pretrain.obs_mode) == ('state', 'pointcloud', 'image')
     assert diffusionnft.train.loss_type == 'rollout'
     assert stepnft.train.loss_type == 'stepnft'
+    assert diffusionnft.wandb_project == 'FlowNFT-stepNFT'
+    assert stepnft.wandb_project == 'FlowNFT-stepNFT'
     assert stepnft_image.train.loss_type == 'stepnft'
     assert stepnft_image.policy_obs_mode == 'image'
     assert stepnft_image.env_kwargs.obs_mode == 'rgbd'
+    assert stepnft_image.train.train_obs_encoder is True
+    assert stepnft_image.episode.parallel_envs == (
+        stepnft_image.episode.num_state_groups
+        * stepnft_image.episode.samples_per_group
+    )
+    assert stepnft_image.train.batch_size == 8
     assert 'pretrain' not in shared and 'train' not in shared
     assert 'obs_mode' not in shared.env_kwargs and 'max_episode_steps' not in shared
     assert 'train' not in state and 'pretrain' not in diffusionnft
@@ -258,6 +268,103 @@ def test_image_reinforcement_observation_adapter_on_cpu():
     assert encoder.agent_pos.shape == (2, 1, 19)
     torch.testing.assert_close(encoder.image[:, :, :3], torch.ones(2, 1, 3, 2, 3))
     torch.testing.assert_close(encoder.image[:, :, 3:], torch.full((2, 1, 1, 2, 3), 0.5))
+    snapshot = adapter.snapshot()
+    assert snapshot['image'].device.type == 'cpu'
+    assert snapshot['image'].dtype == torch.float16
+    assert snapshot['image'].shape == (2, 1, 4, 2, 3)
+
+
+def test_stepnft_raw_image_update_trains_visual_encoder(monkeypatch):
+    import logging
+
+    monkeypatch.setattr(stepnft, 'logger', logging.getLogger(__name__))
+
+    class TinyEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(2, 3)
+
+        def forward(self, image, agent_pos):
+            features = torch.stack(
+                (image.mean(dim=(1, 2, 3, 4)), agent_pos.mean(dim=(1, 2))),
+                dim=1,
+            )
+            return self.proj(features)
+
+    class TinyPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cond = torch.nn.Linear(3, 2)
+
+        def forward(self, sample, timestep, global_cond):
+            return sample * 0.1 + self.cond(global_cond).unsqueeze(-1)
+
+    class DummyAccelerator:
+        device = torch.device('cpu')
+        is_local_main_process = False
+        is_main_process = False
+
+        @staticmethod
+        def autocast():
+            return contextlib.nullcontext()
+
+        @staticmethod
+        def backward(loss):
+            loss.backward()
+
+        @staticmethod
+        def clip_grad_norm_(parameters, max_norm):
+            return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+        @staticmethod
+        def unwrap_model(model):
+            return model
+
+    config = stepnft_image_config()
+    config.train.batch_size = 1
+    config.train.gradient_accumulation_steps = 1
+    config.train.ema = False
+    config.train.stepnft_max_drift = 100.0
+    policy = TinyPolicy()
+    encoder = TinyEncoder()
+    old_policy = copy.deepcopy(policy).eval()
+    ref_policy = copy.deepcopy(policy).eval()
+    old_encoder = copy.deepcopy(encoder).eval()
+    ref_encoder = copy.deepcopy(encoder).eval()
+    parameters = list(policy.parameters()) + list(encoder.parameters())
+    optimizer = torch.optim.Adam(parameters, lr=1e-3)
+    encoder_before = encoder.proj.weight.detach().clone()
+    samples = [{
+        'advantage': 1.0,
+        'filtered': False,
+        'obs_list': [torch.zeros(1, 3)],
+        'raw_obs_list': [{
+            'image': torch.ones(1, 4, 2, 2, dtype=torch.float16),
+            'agent_pos': torch.ones(1, 19),
+        }],
+        'nft_traces': [{
+            'nft_xt': torch.zeros(2, 1),
+            'nft_v': torch.zeros(2, 1),
+            'nft_xnext': torch.ones(2, 1) * 0.2,
+            'nft_step_index': 1,
+            'nft_std': 0.2,
+        }],
+    }]
+
+    step, loss = stepnft.train_on_episode_samples_stepnft(
+        samples=samples,
+        action_unet=policy, action_decoder=None,
+        action_unet_old=old_policy, action_decoder_old=None,
+        action_unet_ref=ref_policy, action_decoder_ref=None,
+        optimizer=optimizer, accelerator=DummyAccelerator(), config=config,
+        ema=None, trainable_parameters=parameters, global_step=0, epoch=0,
+        obs_encoder=encoder, obs_encoder_old=old_encoder,
+        obs_encoder_ref=ref_encoder,
+    )
+
+    assert step == 1
+    assert np.isfinite(loss)
+    assert not torch.equal(encoder_before, encoder.proj.weight.detach())
 
 
 def test_reinforcement_checkpoint_keeps_imitation_metadata(tmp_path, monkeypatch):

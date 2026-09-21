@@ -121,7 +121,7 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     # 初始化wandb
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="flow-diffusionNFT",
+            project_name=config.wandb_project,
             config=config.to_dict(),
             init_kwargs={"wandb": {"name": config.run_name}},
         )
@@ -258,7 +258,9 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
             use_groupnorm=bool(img_encoder_config['use_groupnorm']),
         ).to(accelerator.device)
         obs_encoder.load_state_dict(pretrain_meta['obs_encoder_state_dict'])
-        obs_encoder.requires_grad_(False).eval()
+        train_obs_encoder = bool(getattr(config.train, 'train_obs_encoder', False))
+        obs_encoder.requires_grad_(train_obs_encoder)
+        obs_encoder.train(train_obs_encoder)
         obs_dim = obs_encoder.output_dim
         checkpoint_obs_dim = pretrain_meta.get('obs_dim')
         if checkpoint_obs_dim is not None and int(checkpoint_obs_dim) != obs_dim:
@@ -267,6 +269,7 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
                 f"{checkpoint_obs_dim} 不一致"
             )
     else:
+        train_obs_encoder = False
         if not isinstance(obs, torch.Tensor):
             obs = torch.as_tensor(obs)
         obs_dim = int(obs.shape[-1])
@@ -284,6 +287,7 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     logger.info(f"  pretrain_loss_type: {pretrain_loss_type!r}")
     logger.info(f"  含 normalizer_state_dict: {has_normalizer}")
     logger.info(f"  含 obs_encoder: {obs_encoder is not None}")
+    logger.info(f"  训练 obs_encoder: {train_obs_encoder}")
 
     # 创建模型
     logger.info("初始化模型...")
@@ -349,10 +353,14 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     else:
         logger.info(f"  ActionDecoder参数数量: 0（已旁路）")
 
-    # 获取可训练参数（velocity 模式不训练 decoder）
-    trainable_parameters = list(action_unet.parameters())
+    # 获取可训练参数（图像配置下视觉编码器与 Action UNet 联合更新）
+    policy_parameters = list(action_unet.parameters())
     if action_decoder is not None:
-        trainable_parameters += list(action_decoder.parameters())
+        policy_parameters += list(action_decoder.parameters())
+    obs_encoder_parameters = (
+        list(obs_encoder.parameters()) if train_obs_encoder else []
+    )
+    trainable_parameters = policy_parameters + obs_encoder_parameters
 
     # 创建 EMA
     ema_decay = getattr(config.train, 'ema_decay', 0.9)
@@ -377,8 +385,14 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     else:
         optimizer_cls = torch.optim.AdamW
 
+    optimizer_groups = [{'params': policy_parameters, 'lr': config.train.learning_rate}]
+    if obs_encoder_parameters:
+        optimizer_groups.append({
+            'params': obs_encoder_parameters,
+            'lr': float(config.train.obs_encoder_learning_rate),
+        })
     optimizer = optimizer_cls(
-        trainable_parameters,
+        optimizer_groups,
         lr=config.train.learning_rate,
         betas=(config.train.adam_beta1, config.train.adam_beta2),
         weight_decay=config.train.adam_weight_decay,
@@ -386,9 +400,20 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     )
 
     # 准备模型和优化器（decoder 不存在时跳过）
-    if action_decoder is not None:
+    if action_decoder is not None and train_obs_encoder:
+        action_unet, action_decoder, obs_encoder, optimizer = accelerator.prepare(
+            action_unet, action_decoder, obs_encoder, optimizer
+        )
+        pipeline.action_decoder = action_decoder
+        observation_adapter.encoder = obs_encoder
+    elif action_decoder is not None:
         action_unet, action_decoder, optimizer = accelerator.prepare(action_unet, action_decoder, optimizer)
         pipeline.action_decoder = action_decoder  # 重新挂载（accelerator.prepare 可能包装过）
+    elif train_obs_encoder:
+        action_unet, obs_encoder, optimizer = accelerator.prepare(
+            action_unet, obs_encoder, optimizer
+        )
+        observation_adapter.encoder = obs_encoder
     else:
         action_unet, optimizer = accelerator.prepare(action_unet, optimizer)
     pipeline._action_unet = action_unet
@@ -495,6 +520,12 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     else:
         action_decoder_old = None
 
+    if train_obs_encoder:
+        obs_encoder_old = copy.deepcopy(unwrap_model(obs_encoder, accelerator))
+        obs_encoder_old.to(accelerator.device).eval()
+    else:
+        obs_encoder_old = None
+
     # Reference model（用于KL regularization）
     action_unet_ref = copy.deepcopy(unwrap_model(action_unet, accelerator))
     action_unet_ref.to(accelerator.device)
@@ -511,9 +542,17 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     else:
         action_decoder_ref = None
 
+    if train_obs_encoder:
+        obs_encoder_ref = copy.deepcopy(unwrap_model(obs_encoder, accelerator))
+        obs_encoder_ref.to(accelerator.device)
+        obs_encoder_ref.requires_grad_(False).eval()
+    else:
+        obs_encoder_ref = None
+
     logger.info(
         f"✓ 三模型架构初始化完成（decoder_active={decoder_active}，"
-        f"{'三模型均含 decoder' if decoder_active else 'decoder 全链旁路'}）"
+        f"{'三模型均含 decoder' if decoder_active else 'decoder 全链旁路'}，"
+        f"train_obs_encoder={train_obs_encoder}）"
     )
 
     # autocast 设置
@@ -532,6 +571,10 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
     logger.info(f"  梯度累积步数 = {config.train.gradient_accumulation_steps}")
     logger.info(f"  有效批量大小 = {config.train.batch_size * config.train.gradient_accumulation_steps}")
     logger.info(f"  初始学习率 = {config.train.learning_rate:.2e}")
+    if train_obs_encoder:
+        logger.info(
+            f"  视觉编码器学习率 = {config.train.obs_encoder_learning_rate:.2e}"
+        )
     if lr_scheduler is not None:
         logger.info(f"  学习率调度 = {config.train.lr_scheduler_type} (warmup={config.train.warmup_epochs} epochs)")
     else:
@@ -881,6 +924,9 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
                 action_decoder_old=action_decoder_old,
                 action_unet_ref=action_unet_ref,
                 action_decoder_ref=action_decoder_ref,
+                obs_encoder=obs_encoder,
+                obs_encoder_old=obs_encoder_old,
+                obs_encoder_ref=obs_encoder_ref,
                 optimizer=optimizer,
                 accelerator=accelerator,
                 config=config,

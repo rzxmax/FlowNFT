@@ -98,7 +98,8 @@ def train_on_episode_samples_diffusionnft(
     action_unet_old, action_decoder_old,
     action_unet_ref, action_decoder_ref,
     optimizer, accelerator, config, ema, trainable_parameters,
-    global_step, epoch
+    global_step, epoch, obs_encoder=None, obs_encoder_old=None,
+    obs_encoder_ref=None,
 ):
     """
     DiffusionNFT风格训练函数（完全替换原GRPO训练）
