@@ -11,6 +11,7 @@ Transformer 示例仍使用根目录 `diffusion_policy/` 的其他模块。
 train/
 ├── common/          # 观测处理、时间步与 SDE/ODE 采样、checkpoint、运行环境
 ├── imitation/       # 专家示范上的普通 Flow/Diffusion 模仿训练
+│   ├── launch.py     # 从 config 读取 GPU 列表并启动 Accelerate worker
 │   ├── main.py       # 模仿训练 CLI
 │   ├── trainer.py    # action / velocity 预训练
 │   └── evaluator.py  # 预训练策略评估
@@ -37,6 +38,9 @@ train/
 # 低维状态模仿预训练
 python -m train.imitation.main --config=config/imitation/imitation_state.py --gpu=0
 
+# 配置驱动的单机多卡预训练（GPU 列表见对应 imitation config）
+python -m train.imitation.launch --config=config/imitation/imitation_state.py
+
 # 点云模仿预训练
 python -m train.imitation.main --config=config/imitation/imitation_pointcloud.py --gpu=0
 
@@ -59,6 +63,31 @@ python -m train.reinforcement.main \
   --config=config/reinforcement/reinforcement_stepnft.py \
   --pretrain_checkpoint=checkpoints/imitation/<checkpoint>.pth --gpu=0
 ```
+
+### 单机多卡模仿预训练
+
+模仿预训练使用 Accelerate + PyTorch DDP。先在所用的
+`config/imitation/*.py` 中配置物理 GPU 编号和每卡 batch，例如：
+
+```python
+pretrain.gpu_ids = [0, 2, 4, 6]
+pretrain.batch_size_per_gpu = 32
+pretrain.gradient_accumulation_steps = 2
+pretrain.mixed_precision = 'bf16'  # no / fp16 / bf16
+```
+
+然后统一通过 launcher 启动：
+
+```bash
+python -m train.imitation.launch \
+  --config=config/imitation/imitation_pointcloud.py
+```
+
+有效全局 batch 为 `每卡 batch × GPU 数 × 梯度累积步数`。launcher 会在
+导入 CUDA 前读取 `gpu_ids`；不要对多卡配置直接运行
+`train.imitation.main`。旧的 `train.imitation.main --gpu=N` 仍可用于单卡
+兼容模式。多卡实现、同步方式、风险和验收方案详见根目录
+`MULTI_GPU_PRETRAINING.md`。
 
 点云脚本会把训练指标发送到 W&B 的 `545242836-zju/FlowNFT`。首次运行前，
 使用该账号的 API key 执行 `wandb login`；密钥无需写入脚本或仓库。
@@ -132,6 +161,7 @@ data/datasets/
 ./venv_fm/bin/python -m pytest -q test/test_training_structure.py
 ./venv_fm/bin/python -m compileall -q train config train_sd3_robot_grpo.py
 python -m train.imitation.main --config=config/imitation/imitation_state.py --validate_only
+python -m train.imitation.launch --config=config/imitation/imitation_state.py --validate_only
 python -m train.reinforcement.main --config=config/reinforcement/reinforcement_diffusionnft.py --validate_only
 ```
 

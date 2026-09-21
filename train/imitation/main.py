@@ -22,18 +22,8 @@ def run_imitation(config, gpu_id, *, auto=False, action_loss=False, velocity_los
         config.pretrain.loss_type = 'action'
     elif velocity_loss:
         config.pretrain.loss_type = 'velocity'
-    project = os.environ.get('WANDB_PROJECT')
-    if project:
-        import wandb
-
-        with wandb.init(
-            project=project,
-            entity=os.environ.get('WANDB_ENTITY') or None,
-            config=config.to_dict(),
-            job_type='imitation',
-            tags=[config.pretrain.obs_mode, config.pretrain.loss_type],
-        ) as run:
-            return pretrain_model(config, gpu_id, wandb_run=run)
+    # W&B is initialized inside ``pretrain_model`` after Accelerator knows
+    # which process is the global main process.
     return pretrain_model(config, gpu_id)
 
 
@@ -41,6 +31,8 @@ def main(_):
     if FLAGS.config is None or not hasattr(FLAGS.config, 'pretrain'):
         raise ValueError('Use --config=config/imitation/imitation_state.py (or another imitation preset)')
     if FLAGS.validate_only:
+        from train.imitation.launch import validate_gpu_ids
+
         if FLAGS.action_loss and FLAGS.velocity_loss:
             raise ValueError('--action_loss and --velocity_loss are mutually exclusive')
         mode = FLAGS.config.pretrain.obs_mode
@@ -50,8 +42,23 @@ def main(_):
             raise ValueError(f'Unsupported imitation observation mode: {mode!r}')
         if loss not in ('action', 'velocity'):
             raise ValueError(f'Unsupported imitation loss: {loss!r}')
-        print(f'Imitation configuration OK: obs_mode={mode}, loss_type={loss}')
+        gpu_ids = validate_gpu_ids(FLAGS.config.pretrain.gpu_ids)
+        precision = str(getattr(FLAGS.config.pretrain, 'mixed_precision', 'no'))
+        if precision not in ('no', 'fp16', 'bf16'):
+            raise ValueError(f'Unsupported mixed precision: {precision!r}')
+        print(
+            f'Imitation configuration OK: obs_mode={mode}, loss_type={loss}, '
+            f'gpu_ids={gpu_ids}, mixed_precision={precision}'
+        )
         return
+    configured_gpu_ids = list(getattr(FLAGS.config.pretrain, 'gpu_ids', [FLAGS.gpu]))
+    if (len(configured_gpu_ids) > 1
+            and os.environ.get('FLOWNFT_ACCELERATE_WORKER') != '1'
+            and int(os.environ.get('WORLD_SIZE', '1')) == 1):
+        raise RuntimeError(
+            'Multiple pretrain.gpu_ids require the config-driven launcher: '
+            'python -m train.imitation.launch --config=...'
+        )
     run_imitation(
         FLAGS.config,
         FLAGS.gpu,

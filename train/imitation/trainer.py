@@ -31,10 +31,57 @@ def pretrain_model(config, gpu_id, wandb_run=None):
         loss = MSE(pred_actions, target_actions)
     """
     from torch.utils.data import DataLoader
+    from accelerate import Accelerator, DataLoaderConfiguration
+    from accelerate.utils import (
+        DistributedDataParallelKwargs,
+        InitProcessGroupKwargs,
+        broadcast,
+        broadcast_object_list,
+        set_seed,
+    )
     from diffusers.training_utils import EMAModel
     from diffusers.optimization import get_scheduler
 
-    device = torch.device("cuda:0")  # CUDA_VISIBLE_DEVICES 已在进入 main 前设置
+    accumulation_steps = int(getattr(
+        config.pretrain, 'gradient_accumulation_steps', 1
+    ))
+    if accumulation_steps < 1:
+        raise ValueError('gradient_accumulation_steps 必须至少为 1')
+    mixed_precision = str(getattr(config.pretrain, 'mixed_precision', 'no'))
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=bool(getattr(
+            config.pretrain, 'find_unused_parameters', False
+        ))
+    )
+    process_group_kwargs = InitProcessGroupKwargs(
+        backend=str(getattr(config.pretrain, 'distributed_backend', 'nccl'))
+    )
+    accelerator = Accelerator(
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=accumulation_steps,
+        dataloader_config=DataLoaderConfiguration(
+            use_seedable_sampler=True,
+            data_seed=int(config.seed),
+        ),
+        kwargs_handlers=[ddp_kwargs, process_group_kwargs],
+    )
+    device = accelerator.device
+    set_seed(int(config.seed), device_specific=True)
+    print = accelerator.print
+
+    owns_wandb_run = False
+    project = os.environ.get('WANDB_PROJECT')
+    if wandb_run is None and project and accelerator.is_main_process:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=project,
+            entity=os.environ.get('WANDB_ENTITY') or None,
+            config=config.to_dict(),
+            job_type='imitation',
+            tags=[config.pretrain.obs_mode, config.pretrain.loss_type],
+        )
+        owns_wandb_run = True
 
     obs_mode = getattr(config.pretrain, 'obs_mode', 'state')
     pretrain_loss_type = getattr(config.pretrain, 'loss_type', 'action')
@@ -44,10 +91,35 @@ def pretrain_model(config, gpu_id, wandb_run=None):
             f"应为 'action' 或 'velocity'"
         )
 
+    auto_mode = bool(getattr(config.pretrain, 'auto_mode', False))
+    if auto_mode:
+        eval_interval = int(config.pretrain.auto_eval_interval)
+        num_test_episodes = int(config.pretrain.auto_num_test_episodes)
+        success_threshold = int(config.pretrain.auto_success_threshold)
+        max_epochs = int(config.pretrain.auto_max_epochs)
+    else:
+        max_epochs = int(config.pretrain.num_epochs)
+
+    launched_from_config = (
+        os.environ.get('FLOWNFT_ACCELERATE_WORKER') == '1'
+        or accelerator.num_processes > 1
+    )
+    configured_gpu_ids = (
+        list(getattr(config.pretrain, 'gpu_ids', [gpu_id]))
+        if launched_from_config else [int(gpu_id)]
+    )
+    physical_gpu = (
+        configured_gpu_ids[accelerator.local_process_index]
+        if accelerator.local_process_index < len(configured_gpu_ids)
+        else gpu_id
+    )
+
     print(f"\n{'='*60}")
     print(f"开始预训练 Flow 策略")
     print(f"{'='*60}")
-    print(f"使用物理GPU: {gpu_id}")
+    print(f"物理 GPU IDs: {configured_gpu_ids}")
+    print(f"分布式进程数: {accelerator.num_processes}")
+    print(f"主进程设备: {device}（物理 GPU {physical_gpu}）")
     print(f"观测模式: {obs_mode}")
     print(f"Loss 类型: {pretrain_loss_type}"
           + ("  (multi-step rollout MSE)" if pretrain_loss_type == "action"
@@ -186,13 +258,22 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     training_episode_count = len(dataset.episodes)
     print(f"实际加载 episodes: {training_episode_count}")
 
+    batch_size_per_gpu = int(getattr(
+        config.pretrain, 'batch_size_per_gpu', config.pretrain.batch_size
+    ))
+    num_workers = int(getattr(config.pretrain, 'num_workers', 4))
+    if batch_size_per_gpu < 1 or num_workers < 0:
+        raise ValueError('batch_size_per_gpu 必须为正数，num_workers 不能为负数')
     dataloader = DataLoader(
         dataset,
-        batch_size=config.pretrain.batch_size,
+        batch_size=batch_size_per_gpu,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
+        num_workers=num_workers,
+        pin_memory=bool(getattr(config.pretrain, 'pin_memory', True)),
+        persistent_workers=(
+            bool(getattr(config.pretrain, 'persistent_workers', True))
+            and num_workers > 0
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -275,15 +356,45 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     optimizer = torch.optim.AdamW(
         trainable_params,
         lr=config.pretrain.learning_rate,
+        betas=(
+            float(getattr(config.pretrain, 'adam_beta1', 0.9)),
+            float(getattr(config.pretrain, 'adam_beta2', 0.999)),
+        ),
+        eps=float(getattr(config.pretrain, 'adam_eps', 1e-8)),
         weight_decay=getattr(config.pretrain, 'weight_decay', 1e-6),
     )
 
     # ------------------------------------------------------------------
-    # 5. 学习率调度器
+    # 5. DDP/DataLoader 准备与学习率调度器
     # ------------------------------------------------------------------
+    prepared = [action_unet]
+    if decoder_trains_in_pretrain:
+        prepared.append(action_decoder)
+    if obs_encoder is not None:
+        prepared.append(obs_encoder)
+    prepared.extend([optimizer, dataloader])
+    prepared = list(accelerator.prepare(*prepared))
+
+    prepared_index = 0
+    action_unet = prepared[prepared_index]
+    prepared_index += 1
+    if decoder_trains_in_pretrain:
+        action_decoder = prepared[prepared_index]
+        prepared_index += 1
+    if obs_encoder is not None:
+        obs_encoder = prepared[prepared_index]
+        prepared_index += 1
+    optimizer = prepared[prepared_index]
+    dataloader = prepared[prepared_index + 1]
+
+    # The pipeline must call the DDP-wrapped modules during training.
+    pipeline._action_unet = action_unet
+    pipeline.action_decoder = action_decoder
+
+    updates_per_epoch = (len(dataloader) + accumulation_steps - 1) // accumulation_steps
     if getattr(config.pretrain, 'use_lr_scheduler', True):
-        warmup_steps = int(config.pretrain.warmup_epochs * len(dataloader))
-        total_steps  = config.pretrain.num_epochs * len(dataloader)
+        warmup_steps = int(config.pretrain.warmup_epochs * updates_per_epoch)
+        total_steps = max_epochs * updates_per_epoch
 
         if config.pretrain.lr_scheduler_type == "cosine":
             lr_scheduler = get_scheduler(
@@ -314,14 +425,20 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     ema_start_epoch  = getattr(config.pretrain, 'ema_start_epoch', 20)
     ema_update_freq  = getattr(config.pretrain, 'ema_update_freq', 10)
 
+    raw_action_unet = accelerator.unwrap_model(action_unet)
+    raw_action_decoder = accelerator.unwrap_model(action_decoder)
+    raw_obs_encoder = (
+        accelerator.unwrap_model(obs_encoder) if obs_encoder is not None else None
+    )
+
     ema_unet = EMAModel(
-        action_unet.parameters(),
+        raw_action_unet.parameters(),
         decay=ema_decay,
         use_ema_warmup=False,
     )
     if decoder_trains_in_pretrain:
         ema_decoder = EMAModel(
-            action_decoder.parameters(),
+            raw_action_decoder.parameters(),
             decay=ema_decay,
             use_ema_warmup=False,
         )
@@ -329,7 +446,7 @@ def pretrain_model(config, gpu_id, wandb_run=None):
         ema_decoder = None
     if obs_encoder is not None:
         ema_obs_encoder = EMAModel(
-            obs_encoder.parameters(),
+            raw_obs_encoder.parameters(),
             decay=ema_decay,
             use_ema_warmup=False,
         )
@@ -357,35 +474,41 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     # ------------------------------------------------------------------
     print(f"\n开始训练...")
 
-    auto_mode = config.pretrain.auto_mode if hasattr(config.pretrain, 'auto_mode') else False
     if auto_mode:
-        eval_interval     = config.pretrain.auto_eval_interval
-        num_test_episodes = config.pretrain.auto_num_test_episodes
-        success_threshold = config.pretrain.auto_success_threshold
-        max_epochs        = config.pretrain.auto_max_epochs
         print(f"[Auto模式] 每 {eval_interval} epochs 评估一次")
         print(f"[Auto模式] 每次评估 {num_test_episodes} 个episodes")
         print(f"[Auto模式] 成功阈值: {success_threshold} 次")
         print(f"[Auto模式] 最大训练轮数: {max_epochs}")
     else:
-        max_epochs = config.pretrain.num_epochs
         print(f"[固定模式] 训练 {max_epochs} epochs")
+    effective_global_batch = (
+        batch_size_per_gpu * accelerator.num_processes * accumulation_steps
+    )
+    print(f"每卡 batch size: {batch_size_per_gpu}")
+    print(f"梯度累积步数: {accumulation_steps}")
+    print(f"有效全局 batch size: {effective_global_batch}")
 
     checkpoint_interval = int(getattr(config.pretrain, 'checkpoint_interval', 50))
     checkpoint_keep = int(getattr(config.pretrain, 'checkpoint_keep', 3))
     if checkpoint_interval < 1 or checkpoint_keep < 1:
         raise ValueError('checkpoint_interval 和 checkpoint_keep 必须至少为 1')
-    run_dir = create_run_dir(
-        config.pretrain.checkpoint_dir,
-        epochs=max_epochs,
-        episodes=training_episode_count,
-        obs_mode=obs_mode,
-        auto_mode=auto_mode,
-    )
+    run_dir_value = None
+    if accelerator.is_main_process:
+        run_dir_value = str(create_run_dir(
+            config.pretrain.checkpoint_dir,
+            epochs=max_epochs,
+            episodes=training_episode_count,
+            obs_mode=obs_mode,
+            auto_mode=auto_mode,
+        ))
+    run_dir_value = broadcast_object_list([run_dir_value], from_process=0)[0]
+    from pathlib import Path
+    run_dir = Path(run_dir_value)
     print(f"检查点目录: {run_dir}（每 {checkpoint_interval} epochs 保存，保留最新 {checkpoint_keep} 个）")
 
     def ema_state_dict(model, ema):
         """Use EMA parameters without replacing the weights used by the next epoch."""
+        model = accelerator.unwrap_model(model)
         state = model.state_dict()
         if ema is not None:
             for (name, _), shadow in zip(model.named_parameters(), ema.shadow_params):
@@ -393,6 +516,12 @@ def pretrain_model(config, gpu_id, wandb_run=None):
         return state
 
     def save_checkpoint(epoch_number, loss, stopped=False):
+        accelerator.wait_for_everyone()
+        if not accelerator.is_main_process:
+            saved_path = broadcast_object_list([None], from_process=0)[0]
+            accelerator.wait_for_everyone()
+            return saved_path
+
         path = checkpoint_path(
             run_dir, epoch=epoch_number, episodes=training_episode_count,
             obs_mode=obs_mode, auto_mode=auto_mode,
@@ -419,6 +548,12 @@ def pretrain_model(config, gpu_id, wandb_run=None):
             'auto_mode':                  auto_mode,
             'training_stopped':           stopped if auto_mode else False,
             'normalizer_state_dict':      normalizer.state_dict(),
+            'world_size':                 accelerator.num_processes,
+            'gpu_ids':                    configured_gpu_ids,
+            'batch_size_per_gpu':         batch_size_per_gpu,
+            'effective_global_batch':     effective_global_batch,
+            'gradient_accumulation_steps': accumulation_steps,
+            'mixed_precision':            mixed_precision,
         }
         if obs_encoder is not None:
             ckpt['obs_encoder_state_dict'] = ema_state_dict(obs_encoder, ema_obs_encoder)
@@ -462,7 +597,10 @@ def pretrain_model(config, gpu_id, wandb_run=None):
             wandb_run.summary['checkpoint_path'] = str(path)
             wandb_run.summary['final_loss'] = loss
         print(f"检查点已保存: {path}")
-        return str(path)
+        saved_path = str(path)
+        broadcast_object_list([saved_path], from_process=0)
+        accelerator.wait_for_everyone()
+        return saved_path
 
     action_unet.train()
     action_decoder.train()
@@ -473,12 +611,24 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     training_stopped = False
     final_epoch     = 0
     avg_loss        = 0.0
+    sync_models = [action_unet]
+    if decoder_trains_in_pretrain:
+        sync_models.append(action_decoder)
+    if obs_encoder is not None:
+        sync_models.append(obs_encoder)
 
     for epoch in range(max_epochs):
-        epoch_loss   = 0.0
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{max_epochs}")
+        epoch_loss_sum = 0.0
+        epoch_sample_count = 0
+        progress_bar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch+1}/{max_epochs}",
+            disable=not accelerator.is_local_main_process,
+        )
 
         for batch_idx, batch in enumerate(progress_bar):
+            accumulation_context = accelerator.accumulate(*sync_models)
+            accumulation_context.__enter__()
             # 所有模式统一归一化 action（limits → [-1, 1]）
             action_seq = normalizer['action'].normalize(batch['action'].to(device))
             target_actions = action_seq
@@ -569,44 +719,60 @@ def pretrain_model(config, gpu_id, wandb_run=None):
                 loss = torch.nn.functional.mse_loss(pred_actions, target_actions)
 
             # ---------- 反向传播 ----------
-            optimizer.zero_grad()
-            loss.backward()
+            accelerator.backward(loss)
 
-            torch.nn.utils.clip_grad_norm_(action_unet.parameters(), max_norm=1.0)
-            if decoder_trains_in_pretrain:
-                torch.nn.utils.clip_grad_norm_(action_decoder.parameters(), max_norm=1.0)
-            if obs_encoder is not None:
-                torch.nn.utils.clip_grad_norm_(obs_encoder.parameters(), max_norm=1.0)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(
+                    trainable_params,
+                    max_norm=float(getattr(config.pretrain, 'max_grad_norm', 1.0)),
+                )
 
             optimizer.step()
-            if lr_scheduler is not None:
+            if (lr_scheduler is not None and accelerator.sync_gradients
+                    and not accelerator.optimizer_step_was_skipped):
                 lr_scheduler.step()
+            optimizer.zero_grad()
 
             # ---------- EMA 更新 ----------
-            if epoch >= ema_start_epoch:
-                ema_unet.step(action_unet.parameters())
+            update_happened = (
+                accelerator.sync_gradients
+                and not accelerator.optimizer_step_was_skipped
+            )
+            next_global_step = global_step + int(update_happened)
+            if (update_happened and epoch >= ema_start_epoch
+                    and next_global_step % max(1, ema_update_freq) == 0):
+                ema_unet.step(raw_action_unet.parameters())
                 if ema_decoder is not None:
-                    ema_decoder.step(action_decoder.parameters())
+                    ema_decoder.step(raw_action_decoder.parameters())
                 if ema_obs_encoder is not None:
-                    ema_obs_encoder.step(obs_encoder.parameters())
+                    ema_obs_encoder.step(raw_obs_encoder.parameters())
 
-            epoch_loss  += loss.item()
-            global_step += 1
+            accumulation_context.__exit__(None, None, None)
+
+            epoch_loss_sum += loss.detach().float().item() * batch_size
+            epoch_sample_count += batch_size
+            if update_happened:
+                global_step = next_global_step
 
             current_lr = optimizer.param_groups[0]['lr']
-            if wandb_run is not None:
+            if wandb_run is not None and update_happened:
                 wandb_run.log({
                     'train/batch_loss': loss.item(),
                     'train/learning_rate': current_lr,
                     'train/epoch': epoch + 1,
                 }, step=global_step, commit=False)
-            progress_bar.set_postfix({
-                'Loss': f'{loss.item():.6f}',
-                'LR':   f'{current_lr:.2e}',
-                'Step': global_step,
-            })
+            if accelerator.is_local_main_process:
+                progress_bar.set_postfix({
+                    'Loss': f'{loss.item():.6f}',
+                    'LR':   f'{current_lr:.2e}',
+                    'Step': global_step,
+                })
 
-        avg_loss   = epoch_loss / len(dataloader)
+        loss_stats = torch.tensor(
+            [epoch_loss_sum, epoch_sample_count], device=device, dtype=torch.float64
+        )
+        loss_stats = accelerator.reduce(loss_stats, reduction='sum')
+        avg_loss = (loss_stats[0] / loss_stats[1].clamp_min(1)).item()
         current_lr = optimizer.param_groups[0]['lr']
 
         ema_status = "Active" if epoch >= ema_start_epoch else f"Inactive (starts at epoch {ema_start_epoch})"
@@ -633,33 +799,62 @@ def pretrain_model(config, gpu_id, wandb_run=None):
             print(f"[Auto模式评估] Epoch {epoch+1}: 开始评估...")
             print(f"{'='*60}")
 
-            ema_unet.copy_to(action_unet.parameters())
+            # Every rank swaps to EMA and later restores the exact training
+            # weights. Only rank 0 runs ManiSkill, using unwrapped modules so
+            # DDP does not start collectives while the other ranks wait.
+            ema_unet.store(raw_action_unet.parameters())
+            ema_unet.copy_to(raw_action_unet.parameters())
             if ema_decoder is not None:
-                ema_decoder.copy_to(action_decoder.parameters())
+                ema_decoder.store(raw_action_decoder.parameters())
+                ema_decoder.copy_to(raw_action_decoder.parameters())
             if ema_obs_encoder is not None:
-                ema_obs_encoder.copy_to(obs_encoder.parameters())
+                ema_obs_encoder.store(raw_obs_encoder.parameters())
+                ema_obs_encoder.copy_to(raw_obs_encoder.parameters())
 
-            # 所有模式都传 normalizer（state 模式现在也需要用来归一化 obs / 反归一化 action）
-            _eval_normalizer = normalizer
-            # velocity 模式：decoder 未参与训练，评估时跳过 decoder（pipeline_with_logprob 在
-            # action_decoder=None 时会直接把 UNet 输出当作速度场使用，与训练严格对齐）
-            _eval_decoder = action_decoder if decoder_trains_in_pretrain else None
-            success_count, total_count, avg_reward = evaluate_pretrain_model(
-                action_unet, _eval_decoder, pipeline, config, device,
-                num_test_episodes, obs_encoder=obs_encoder,
-                normalizer=_eval_normalizer,
-                obs_mode=obs_mode,
+            accelerator.wait_for_everyone()
+            should_stop = False
+            if accelerator.is_main_process:
+                pipeline._action_unet = raw_action_unet
+                pipeline.action_decoder = raw_action_decoder
+                _eval_decoder = (
+                    raw_action_decoder if decoder_trains_in_pretrain else None
+                )
+                success_count, total_count, avg_reward = evaluate_pretrain_model(
+                    raw_action_unet, _eval_decoder, pipeline, config, device,
+                    num_test_episodes, obs_encoder=raw_obs_encoder,
+                    normalizer=normalizer,
+                    obs_mode=obs_mode,
+                )
+
+                print(f"[Auto模式评估] 成功率: {success_count}/{total_count}")
+                print(f"[Auto模式评估] 平均奖励: {avg_reward:.3f}")
+                if wandb_run is not None:
+                    wandb_run.log({
+                        'eval/success_rate': success_count / total_count if total_count else 0.0,
+                        'eval/average_reward': avg_reward,
+                    }, step=global_step)
+                should_stop = success_count >= success_threshold
+
+            stop_tensor = torch.tensor(
+                int(should_stop), device=device, dtype=torch.int32
             )
+            stop_tensor = broadcast(stop_tensor, from_process=0)
 
-            print(f"[Auto模式评估] 成功率: {success_count}/{total_count}")
-            print(f"[Auto模式评估] 平均奖励: {avg_reward:.3f}")
-            if wandb_run is not None:
-                wandb_run.log({
-                    'eval/success_rate': success_count / total_count if total_count else 0.0,
-                    'eval/average_reward': avg_reward,
-                }, step=global_step)
+            ema_unet.restore(raw_action_unet.parameters())
+            if ema_decoder is not None:
+                ema_decoder.restore(raw_action_decoder.parameters())
+            if ema_obs_encoder is not None:
+                ema_obs_encoder.restore(raw_obs_encoder.parameters())
+            pipeline._action_unet = action_unet
+            pipeline.action_decoder = action_decoder
+            action_unet.train()
+            if decoder_trains_in_pretrain:
+                action_decoder.train()
+            if obs_encoder is not None:
+                obs_encoder.train()
+            accelerator.wait_for_everyone()
 
-            if success_count >= success_threshold:
+            if bool(stop_tensor.item()):
                 print(f"\n{'='*60}")
                 print(f"[Auto模式] 达到成功阈值！停止训练于 epoch {epoch+1}")
                 print(f"{'='*60}\n")
@@ -667,9 +862,6 @@ def pretrain_model(config, gpu_id, wandb_run=None):
                 break
             else:
                 print(f"[Auto模式] 未达到阈值，继续训练...\n")
-                action_unet.train()
-                if decoder_trains_in_pretrain:
-                    action_decoder.train()
 
     if auto_mode and not training_stopped:
         print(f"\n[Auto模式] 达到最大训练轮数 {max_epochs}，停止训练")
@@ -705,4 +897,8 @@ def pretrain_model(config, gpu_id, wandb_run=None):
     print(f"  最终损失: {avg_loss:.6f}")
     print(f"{'='*60}\n")
 
+    accelerator.wait_for_everyone()
+    if owns_wandb_run:
+        wandb_run.finish()
+    accelerator.end_training()
     return checkpoint_path_saved
