@@ -123,6 +123,10 @@ ManiSkill replay H5 放到这些清单所指的位置。示例命令：
 python -m train.imitation.main \
   --config=config/imitation/imitation_state.py --gpu=0
 
+# 单机多卡模仿预训练；GPU 编号由 imitation config 的 pretrain.gpu_ids 指定
+python -m train.imitation.launch \
+  --config=config/imitation/imitation_state.py
+
 # DiffusionNFT 强化微调
 python -m train.reinforcement.main \
   --config=config/reinforcement/reinforcement_diffusionnft.py \

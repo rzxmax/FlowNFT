@@ -10,10 +10,21 @@ def get_config():
     pretrain = config.pretrain = ml_collections.ConfigDict()
     pretrain.num_episodes = 1000
     pretrain.num_epochs = 200
+    # Per-device batch size. ``batch_size`` is kept as a compatibility alias
+    # for older local presets; the trainer prefers this explicit field.
     pretrain.batch_size = 64
+    pretrain.batch_size_per_gpu = 64
+    # Physical GPU IDs consumed by ``python -m train.imitation.launch``.
+    pretrain.gpu_ids = [0]
+    pretrain.mixed_precision = 'no'
+    pretrain.find_unused_parameters = False
+    pretrain.num_workers = 4
+    pretrain.pin_memory = True
+    pretrain.persistent_workers = True
+    pretrain.distributed_backend = 'nccl'
     pretrain.learning_rate = 1e-4
     pretrain.checkpoint_dir = 'checkpoints/imitation'
-    pretrain.checkpoint_interval = 50
+    pretrain.checkpoint_interval = 200
     pretrain.checkpoint_keep = 3
     pretrain.gradient_accumulation_steps = 1
     pretrain.max_grad_norm = 1.0

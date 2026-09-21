@@ -1,8 +1,9 @@
 """CPU smoke tests for the refactored training boundaries."""
 
-from datetime import datetime
 import contextlib
 import copy
+from datetime import datetime
+import os
 
 import numpy as np
 import pytest
@@ -61,8 +62,20 @@ def test_stage_configs_are_independent():
     assert 'img_size' not in pointcloud.pretrain
     assert 'stepnft_beta' not in diffusionnft.train
     assert 'beta' not in stepnft.train
+    assert state.pretrain.gpu_ids == [0]
+    assert state.pretrain.batch_size_per_gpu == 64
+    assert state.pretrain.mixed_precision == 'no'
     pointcloud.pretrain.obs_mode = 'state'
     assert rgbd.pretrain.obs_mode == 'image'
+
+
+def test_distributed_worker_does_not_overwrite_gpu_visibility(monkeypatch):
+    from train.common.bootstrap import configure_gpu
+
+    monkeypatch.setenv('FLOWNFT_ACCELERATE_WORKER', '1')
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '2,5')
+    configure_gpu(['--gpu=7'])
+    assert os.environ['CUDA_VISIBLE_DEVICES'] == '2,5'
 
 
 def test_imitation_dispatch_and_loss_flags(monkeypatch):
@@ -83,24 +96,42 @@ def test_imitation_dispatch_and_loss_flags(monkeypatch):
         )
 
 
-def test_imitation_wandb_tracking(monkeypatch):
-    import wandb
-
+def test_imitation_dispatch_leaves_wandb_to_trainer(monkeypatch):
     config = pointcloud_config()
-    run = MagicMock()
-    tracker = MagicMock()
-    tracker.__enter__.return_value = run
-    init = MagicMock(return_value=tracker)
     train = MagicMock(return_value='checkpoint.pth')
     monkeypatch.setenv('WANDB_PROJECT', 'FlowNFT')
     monkeypatch.setenv('WANDB_ENTITY', '545242836-zju')
-    monkeypatch.setattr(wandb, 'init', init)
     monkeypatch.setattr(imitation_main, 'pretrain_model', train)
 
     assert imitation_main.run_imitation(config, 0) == 'checkpoint.pth'
-    assert init.call_args.kwargs['project'] == 'FlowNFT'
-    assert init.call_args.kwargs['entity'] == '545242836-zju'
-    assert train.call_args.kwargs['wandb_run'] is run
+    train.assert_called_once_with(config, 0)
+
+
+def test_imitation_multi_gpu_launch_command_and_validation():
+    from train.imitation.launch import build_launch_command, validate_gpu_ids
+
+    config = state_config()
+    config.pretrain.gpu_ids = [1, 3]
+    config.pretrain.mixed_precision = 'bf16'
+    command = build_launch_command(
+        config,
+        ['--config=config/imitation/imitation_state.py'],
+        python='/python',
+    )
+
+    assert command[:3] == ['/python', '-m', 'accelerate.commands.launch']
+    assert command[command.index('--num_processes') + 1] == '2'
+    assert command[command.index('--gpu_ids') + 1] == '1,3'
+    assert command[command.index('--mixed_precision') + 1] == 'bf16'
+    assert command[-3:] == [
+        '-m',
+        'train.imitation.main',
+        '--config=config/imitation/imitation_state.py',
+    ]
+
+    for invalid in ([], [0, 0], [-1], [True], ['0']):
+        with pytest.raises(ValueError):
+            validate_gpu_ids(invalid)
 
 
 def test_stage_entrypoints_dispatch(monkeypatch):

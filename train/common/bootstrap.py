@@ -10,6 +10,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def configure_gpu(argv=None):
     """Preserve the legacy ``--gpu`` selection before CUDA is imported."""
+    # A launcher must decide visibility before importing the worker.  Never
+    # collapse its device set back to GPU 0 inside every distributed process.
+    if (os.environ.get('FLOWNFT_ACCELERATE_WORKER') == '1'
+            or 'LOCAL_RANK' in os.environ
+            or int(os.environ.get('WORLD_SIZE', '1')) > 1):
+        return os.environ.get('LOCAL_RANK', '0')
+
     args = list(sys.argv[1:] if argv is None else argv)
     gpu_id = 0
     for index, arg in enumerate(args):
