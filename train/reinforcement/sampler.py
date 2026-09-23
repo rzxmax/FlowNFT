@@ -33,8 +33,9 @@ def sample_complete_trajectories(
       - reward: 累积总奖励
       - num_steps: 轨迹总步数
       - num_flow_calls: Flow调用次数
-      - first_done_step: 首次done的步数（-1表示未done）
-      - terminated: 是否成功
+      - success: 环境任务是否成功（来自 info['success']）
+      - terminated: 环境是否发生任务定义的终止（可能是成功或失败）
+      - truncated: 是否因时间上限等外部条件截断
       - group_id: GRPO组ID
       - episode_id: 初始状态的episode_id
     """
@@ -109,6 +110,9 @@ def sample_complete_trajectories(
     env_nft_traces = [[] for _ in range(num_envs)] if use_stepnft else None
 
     env_done = torch.zeros(num_envs, dtype=torch.bool, device=accelerator.device)
+    env_success = torch.zeros_like(env_done)
+    env_terminated = torch.zeros_like(env_done)
+    env_truncated = torch.zeros_like(env_done)
     env_steps = torch.zeros(num_envs, dtype=torch.long, device=accelerator.device)
     env_first_done_step = torch.full((num_envs,), -1, dtype=torch.long, device=accelerator.device)
 
@@ -242,6 +246,37 @@ def sample_complete_trajectories(
                     reward = torch.tensor(reward, device=accelerator.device)
                 if not isinstance(terminated, torch.Tensor):
                     terminated = torch.tensor(terminated, device=accelerator.device)
+                if not isinstance(truncated, torch.Tensor):
+                    truncated = torch.tensor(truncated, device=accelerator.device)
+                terminated = terminated.to(
+                    device=accelerator.device, dtype=torch.bool
+                ).reshape(-1)
+                truncated = truncated.to(
+                    device=accelerator.device, dtype=torch.bool
+                ).reshape(-1)
+
+                # Success is a task outcome, whereas terminated may also mean a
+                # task-defined failure.  Keep all three signals separate so a
+                # future environment with ``fail`` cannot turn failures into
+                # positive-advantage samples.
+                success_value = info.get('success', False) if isinstance(info, dict) else False
+                success = torch.as_tensor(
+                    success_value, device=accelerator.device, dtype=torch.bool
+                )
+                if success.ndim == 0:
+                    success = success.expand_as(terminated)
+                else:
+                    success = success.reshape(-1)
+                if success.numel() != terminated.numel():
+                    raise ValueError(
+                        "info['success'] 的 batch 维度与 terminated 不一致: "
+                        f"{success.numel()} != {terminated.numel()}"
+                    )
+
+                step_success = success & step_active_mask
+                step_terminated = terminated & step_active_mask
+                step_truncated = truncated & step_active_mask
+                step_done = step_terminated | step_truncated
 
                 # ✅ 相对奖励计算（参考RLinf）
                 # 计算奖励差值而非绝对值，避免累积奖励导致的长度偏差
@@ -253,22 +288,36 @@ def sample_complete_trajectories(
                 for env_idx in range(num_envs):
                     if step_active_mask[env_idx]:  # 只在环境未done时记录
                         env_step_rewards[env_idx].append(reward_diff[env_idx].item())  # 使用相对奖励
-                        env_step_dones[env_idx].append(terminated[env_idx].item())
+                        env_step_dones[env_idx].append(step_done[env_idx].item())
 
                 # 记录首次done的步数（Valid Action Mask）
-                newly_done = terminated & (env_first_done_step == -1)
+                newly_done = step_done & (env_first_done_step == -1)
                 env_first_done_step[newly_done] = env_steps[newly_done]
 
-                # ✅ 关键修复：累积done状态（而非覆盖）
-                # 这确保一旦环境done，它会保持done状态
-                # 防止auto_reset导致的状态重置（虽然我们已禁用auto_reset）
-                env_done = env_done | terminated  # 累积而非覆盖
+                # Accumulate outcome signals only while each environment is
+                # active.  ``done`` controls rollout termination; ``success``
+                # is kept independently for reward/advantage assignment.
+                env_success |= step_success
+                env_terminated |= step_terminated
+                env_truncated |= step_truncated
+                env_done |= step_done
                 env_steps[step_active_mask] += 1
 
             if use_stepnft:
                 obs_tensor = observation_adapter.condition()
 
         flow_call_count += 1
+
+    # The sampler enforces its own horizon because the vectorized ManiSkill
+    # environment reports no TimeLimit truncation here.  Preserve that outcome
+    # explicitly instead of making horizon-limited trajectories look unfinished.
+    horizon_truncated = (~env_done) & (env_steps >= max_steps)
+    if horizon_truncated.any():
+        env_truncated |= horizon_truncated
+        env_done |= horizon_truncated
+        for env_idx in horizon_truncated.nonzero(as_tuple=False).flatten().tolist():
+            if env_step_dones[env_idx]:
+                env_step_dones[env_idx][-1] = True
 
     # 构建样本
     timesteps = pipeline.scheduler.timesteps.unsqueeze(0).to(accelerator.device)
@@ -307,7 +356,9 @@ def sample_complete_trajectories(
             "reward": cumulative_reward,
             "num_steps": env_steps[env_idx].item(),
             "num_flow_calls": len(env_obs_list[env_idx]),
-            "terminated": env_done[env_idx].item(),
+            "success": env_success[env_idx].item(),
+            "terminated": env_terminated[env_idx].item(),
+            "truncated": env_truncated[env_idx].item(),
             "group_id": group_id,
             "episode_id": env_episode_id,
             # ✅ 滑动窗口：添加逐步历史

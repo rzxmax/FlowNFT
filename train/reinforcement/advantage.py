@@ -18,7 +18,7 @@ def compute_episode_level_advantages(samples, num_train_timesteps, config):
 
     2. "single"：单条轨迹绝对优势
        - 不依赖组内对比，每条轨迹独立判定
-       - 成功（reward >= config.stage.max_reward）→ +1
+       - 环境 success=True → +1
        - 失败 → -1
        - 不做 Success Rate Filter（绝对值 advantage 本身有学习信号）
     """
@@ -26,12 +26,11 @@ def compute_episode_level_advantages(samples, num_train_timesteps, config):
 
     # ========== Single 模式：每条轨迹独立 ±1 ==========
     if advantage_type == 'single':
-        max_reward = config.stage.max_reward
         advantage_scale = getattr(config.stage, 'advantage_scale', 1.0)
 
         success_count = 0
         for sample in samples:
-            is_success = sample["reward"] >= max_reward
+            is_success = bool(sample["success"])
             sample["filtered"] = False
             sample["advantage"] = (1.0 if is_success else -1.0) * advantage_scale
             success_count += int(is_success)
@@ -71,7 +70,7 @@ def compute_episode_level_advantages(samples, num_train_timesteps, config):
 
         # ✅ Success Rate Filter（参考RLinf）
         # 检查组内是否全部成功或全部失败
-        success_count = sum(1 for s in group if s["terminated"])
+        success_count = sum(1 for s in group if s["success"])
         all_success = (success_count == len(group))
         all_fail = (success_count == 0)
 

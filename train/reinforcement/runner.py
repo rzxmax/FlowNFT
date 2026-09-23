@@ -644,7 +644,7 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
                 continue
 
             # 统计单次rollout信息
-            success_count = sum(1 for s in samples if s["terminated"])
+            success_count = sum(1 for s in samples if s["success"])
             avg_reward = np.mean([s["reward"] for s in samples])
 
             logger.info(f"  采样: {len(samples)}条轨迹, 成功率: {success_count/len(samples)*100:.1f}%, 平均奖励: {avg_reward:.3f}")
@@ -656,7 +656,7 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
             continue
 
         # 统计所有rollout的总体信息
-        total_success_count = sum(1 for s in all_samples if s["terminated"])
+        total_success_count = sum(1 for s in all_samples if s["success"])
         total_avg_reward = np.mean([s["reward"] for s in all_samples])
         total_avg_steps = np.mean([s["num_steps"] for s in all_samples])
         total_avg_flow_calls = np.mean([s["num_flow_calls"] for s in all_samples])
@@ -791,7 +791,7 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
 
                 # 检查是否被过滤
                 is_filtered = group[0].get("filtered", False)
-                success_count = sum(1 for s in group if s["terminated"])
+                success_count = sum(1 for s in group if s["success"])
 
                 # 计算组内统计（使用相对奖励的总和）
                 group_rewards = np.array([s["reward"] for s in group])
@@ -809,7 +809,7 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
                 logger.info(f"  组统计: 平均总奖励={group_mean:.4f}, std={group_std:.4f}, 成功率={success_count}/{len(group)}")
 
                 for i, sample in enumerate(group):
-                    status = "成功" if sample["terminated"] else "未完成"
+                    status = "成功" if sample["success"] else "未完成"
 
                     # 如果被过滤，不计算advantage
                     if is_filtered:
@@ -952,7 +952,7 @@ def run_reinforcement(config, physical_gpu_id, pretrain_checkpoint=None):
             for group_id in range(num_state_groups):
                 group_samples = [s for s in all_samples if s["group_id"] == group_id]
                 if len(group_samples) > 0:
-                    group_success = sum(1 for s in group_samples if s["terminated"]) / len(group_samples)
+                    group_success = sum(1 for s in group_samples if s["success"]) / len(group_samples)
                     group_success_rates.append(group_success)
 
             # 计算组间成功率的方差（检查策略的稳定性）

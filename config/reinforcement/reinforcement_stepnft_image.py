@@ -35,8 +35,10 @@ def get_config():
     config.episode.samples_per_group = 1
     config.episode.parallel_envs = 256
     config.train.batch_size = 8
-    config.train.gradient_accumulation_steps = 4
+    # Keep the memory-bounded microbatch while matching the state policy's
+    # effective batch size: 8 * 32 = 256 (state: 64 * 4 = 256).
+    config.train.gradient_accumulation_steps = 32
     config.train.train_obs_encoder = True
-    config.train.obs_encoder_learning_rate = 1e-6
+    config.train.obs_encoder_learning_rate = 1e-5
 
     return config

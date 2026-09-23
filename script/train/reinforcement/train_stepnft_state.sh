@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$repo_root"
@@ -11,8 +11,8 @@ if [[ ! -f "$checkpoint" ]]; then
   exit 1
 fi
 
-exec ./venv_fm/bin/python -m train.reinforcement.main \
+./venv_fm/bin/python -m train.reinforcement.main \
   --config=config/reinforcement/reinforcement_stepnft.py \
   --pretrain_checkpoint="$checkpoint" \
-  --gpu="$gpu_id" \
+  --gpu=1 \
   "$@"

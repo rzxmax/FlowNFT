@@ -53,6 +53,11 @@ def test_stage_configs_are_independent():
         * stepnft_image.episode.samples_per_group
     )
     assert stepnft_image.train.batch_size == 8
+    assert (
+        stepnft_image.train.batch_size
+        * stepnft_image.train.gradient_accumulation_steps
+        == stepnft.train.batch_size * stepnft.train.gradient_accumulation_steps
+    )
     assert 'pretrain' not in shared and 'train' not in shared
     assert 'obs_mode' not in shared.env_kwargs and 'max_episode_steps' not in shared
     assert 'train' not in state and 'pretrain' not in diffusionnft
@@ -188,7 +193,10 @@ def test_advantage_modes():
     config = diffusionnft_config()
     config.stage.advantage_type = 'single'
     config.stage.max_reward = 5.0
-    samples = [{'reward': 5.0}, {'reward': 1.0}]
+    samples = [
+        {'reward': 4.9999999, 'success': True},
+        {'reward': 5.0, 'success': False},
+    ]
     result, stats = compute_episode_level_advantages(samples, 10, config)
     assert [item['advantage'] for item in result] == [1.0, -1.0]
     assert stats['filtered_samples'] == 0
@@ -197,8 +205,8 @@ def test_advantage_modes():
     config.episode.num_state_groups = 1
     config.episode.samples_per_group = 2
     samples = [
-        {'group_id': 0, 'reward': 5.0, 'terminated': True},
-        {'group_id': 0, 'reward': 1.0, 'terminated': False},
+        {'group_id': 0, 'reward': 5.0, 'success': True},
+        {'group_id': 0, 'reward': 1.0, 'success': False},
     ]
     result, stats = compute_episode_level_advantages(samples, 10, config)
     assert result[0]['advantage'] == pytest.approx(1.0)
